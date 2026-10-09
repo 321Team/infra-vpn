@@ -1,0 +1,37 @@
+name: P2-VPN-01 package
+
+# p2-vpn-01/ 의 정적·렌더 시험과, CentOS Stream 9·10 배포판 Libreswan·nftables 실제 문법 시험.
+# 컨테이너 안에서만 실행하며 서버·클러스터·Secret을 쓰지 않는다.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - p2-vpn-01/**
+      - .github/workflows/p2-vpn-01.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p2-vpn-01-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source without persisting credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Static, render and distro syntax tests
+        env:
+          P2VPN_CONTAINER_IT: "1"
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          bash -n p2-vpn-01/p2vpn.sh
+          python3 -m unittest discover -s p2-vpn-01/tests -v

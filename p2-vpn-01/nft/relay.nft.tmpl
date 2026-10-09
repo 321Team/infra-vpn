@@ -1,0 +1,29 @@
+# P2-VPN-01 (#37) — Relay host FORWARD 허용표. /etc/fds-p2-vpn/forward.nft
+# firewalld 표와 별개인 전용 표다. 포워딩되는 패킷은 모든 forward 훅을 통과해야 하므로 여기서 drop하면 막힌다.
+# 이 표가 올라온 뒤에만 fds-p2-vpn-forward.service가 ip_forward=1을 켠다(fail-closed).
+table inet fds_p2_vpn
+delete table inet fds_p2_vpn
+table inet fds_p2_vpn {
+	chain forward {
+		type filter hook forward priority filter + 10; policy drop;
+		ip saddr 10.20.0.0/16 ip daddr 10.1.93.0/24 jump to_onprem
+		ip saddr 10.1.93.0/24 ip daddr 10.20.0.0/16 jump from_onprem
+		counter comment "그 밖의 포워딩은 policy drop"
+	}
+
+	# VPC → On-Prem: 반드시 터널(IPsec)로 나가야 한다. SA가 없으면 평문으로 새지 않게 버린다.
+	chain to_onprem {
+		rt ipsec missing counter drop comment "SA 없음 - 평문 우회 차단"
+		ct state established,related accept
+		ip saddr 10.20.10.0/24 ip daddr 10.1.93.55 tcp dport 5432 ct state new counter accept comment "worker -> db01 5432"
+@@HARBOR@@
+		counter drop comment "승인 밖 목적지·포트"
+	}
+
+	# On-Prem → VPC: 터널에서 복호화된 응답만 받는다. On-Prem에서 새 연결을 열지 않는다.
+	chain from_onprem {
+		meta ipsec missing counter drop comment "복호화되지 않은 패킷"
+		ct state established,related accept
+		counter drop comment "On-Prem 개시 새 연결"
+	}
+}

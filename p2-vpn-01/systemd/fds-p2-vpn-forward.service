@@ -1,0 +1,19 @@
+# P2-VPN-01 (#37) — fail-closed 포워딩. FORWARD 허용표를 먼저 올리고, 성공했을 때만 ip_forward=1을 켠다.
+# 영구 sysctl은 ip_forward=0으로 둔다. 이 유닛이 실패하거나 멈추면 포워딩은 꺼진 채로 남는다.
+[Unit]
+Description=FDS P2-VPN-01 forward allowlist then IPv4 forwarding
+After=firewalld.service network-online.target
+Wants=network-online.target
+Before=ipsec.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/fds-p2-vpn/forward.nft
+ExecStart=/usr/sbin/nft list table inet fds_p2_vpn
+ExecStartPost=/usr/sbin/sysctl -w net.ipv4.ip_forward=1
+ExecStop=/usr/sbin/sysctl -w net.ipv4.ip_forward=0
+ExecStopPost=-/usr/sbin/nft delete table inet fds_p2_vpn
+
+[Install]
+WantedBy=multi-user.target
