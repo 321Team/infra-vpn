@@ -303,7 +303,12 @@ do_probe() {
   return 0
 }
 
-conn_loaded() { ipsec status 2>/dev/null | grep -qF "\"$CONN\""; }
+# conn 등록 상태: 0=등록됨, 1=조회 성공·없음, 2=조회 실패(부재로 보지 않는다)
+conn_loaded() {
+  local out
+  out=$(ipsec status 2>/dev/null) || return 2
+  grep -qF "\"$CONN\"" <<< "$out"
+}
 
 do_rollback() {
   need_root; identity_check
@@ -321,13 +326,25 @@ do_rollback() {
   forward_off || die "ip_forward=0 설정/확인 실패 — 허용표를 그대로 두고 중단(재시도 가능)"
   echo "== ip_forward=0 확인"
 
-  # 2) conn: 등록돼 있을 때만 지우고, 지운 뒤 남아 있으면 실패. 이미 없음과 실패를 구분한다.
-  if systemctl is-active --quiet ipsec && conn_loaded; then
-    ipsec_cmd delete "$CONN" || fail "conn 삭제 명령 실패"
-    conn_loaded && fail "conn이 아직 등록돼 있음"
-  else
-    echo "conn: 등록 없음"
-  fi
+  # 2) conn: 등록·없음·조회 실패를 구분한다. 삭제·부재 확인·조회가 실패하면 ip_forward=0과
+  #    허용표·유닛을 그대로 둔 채 멈춘다(원인 해소 뒤 같은 RUN으로 다시 rollback).
+  local svc conn_rc
+  svc=$(systemctl is-active ipsec 2>/dev/null) || true
+  case "$svc" in
+    active)
+      conn_loaded; conn_rc=$?
+      case "$conn_rc" in
+        0)
+          ipsec_cmd delete "$CONN" || die "conn 삭제 실패 — ip_forward=0·통제 보존, 같은 RUN으로 재시도"
+          conn_loaded; conn_rc=$?
+          [ "$conn_rc" = 1 ] || die "conn 부재 확인 실패(rc=$conn_rc) — ip_forward=0·통제 보존, 같은 RUN으로 재시도"
+          echo "conn: 삭제·부재 확인" ;;
+        1) echo "conn: 등록 없음(조회 확인)" ;;
+        *) die "conn 조회 실패 — ip_forward=0·통제 보존, 같은 RUN으로 재시도" ;;
+      esac ;;
+    inactive|failed) echo "ipsec.service: $svc — conn 적재 없음" ;;
+    *) die "ipsec.service 상태 불확실('$svc') — ip_forward=0·통제 보존, 같은 RUN으로 재시도" ;;
+  esac
   if [ -e "$CONF" ]; then rm -f "$CONF" || fail "$CONF 삭제 실패"; fi
   if [ -e "$SECRETS" ]; then shred -u "$SECRETS" 2>/dev/null || rm -f "$SECRETS" || fail "secrets 삭제 실패"; fi
   [ -e "$SECRETS" ] && fail "secrets가 남아 있음"
@@ -354,11 +371,7 @@ do_rollback() {
       fail "$GW_SYSCTL 백업 없음 — 파일 복원 불가"
     fi
   fi
-  if sysctl -w "net.ipv4.ip_forward=${ip_forward_runtime:-0}" > /dev/null; then
-    [ "$(sysctl -n net.ipv4.ip_forward)" = "${ip_forward_runtime:-0}" ] || fail "ip_forward 원복 readback 불일치"
-  else
-    fail "ip_forward=${ip_forward_runtime:-0} 원복 실패"
-  fi
+  # 런타임 ip_forward는 모든 정리·확인이 끝난 뒤(아래)에만 apply 전 값으로 되돌린다. 그 전까지 0 유지.
 
   # 5) 이 RUN에서 추가한 firewalld 항목만 제거
   if [ "$ROLE" = relay ]; then
@@ -382,8 +395,17 @@ do_rollback() {
     systemctl disable ipsec > /dev/null 2>&1 || fail "ipsec.service disable 실패"
   fi
 
+  # 7) 정리가 모두 성공했을 때만 apply 전 런타임 ip_forward 복원(readback). 실패가 있으면 0 유지.
+  if [ "${#failed[@]}" -eq 0 ]; then
+    if sysctl -w "net.ipv4.ip_forward=${ip_forward_runtime:-0}" > /dev/null; then
+      [ "$(sysctl -n net.ipv4.ip_forward)" = "${ip_forward_runtime:-0}" ] || fail "ip_forward 원복 readback 불일치"
+    else
+      fail "ip_forward=${ip_forward_runtime:-0} 원복 실패"
+    fi
+  fi
   if [ "${#failed[@]}" -gt 0 ]; then
-    echo "ROLLBACK_INCOMPLETE role=$ROLE run=$run failed=${#failed[@]} — 원인 해소 뒤 같은 RUN으로 다시 rollback" >&2
+    forward_off || failed+=("ip_forward=0 재확인 실패")
+    echo "ROLLBACK_INCOMPLETE role=$ROLE run=$run failed=${#failed[@]} ip_forward=$(sysctl -n net.ipv4.ip_forward) — 원인 해소 뒤 같은 RUN으로 다시 rollback" >&2
     printf '  - %s\n' "${failed[@]}" >&2
     exit 1
   fi

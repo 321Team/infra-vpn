@@ -150,14 +150,15 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 
 `sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일(활성 RUN과 다른 RUN이면 거부):
 1. **먼저 `ip_forward=0`을 readback으로 확인.** 확인되지 않으면 허용표·유닛을 건드리지 않고 멈춤
-2. conn이 등록돼 있을 때만 삭제하고, 삭제 뒤에도 남아 있으면 실패로 기록(이미 없음과 구분)
+2. conn: `ipsec status`로 등록·없음·**조회 실패**를 구분. 삭제 실패·삭제 뒤 부재 확인 실패·조회 실패·`ipsec.service` 상태 불확실이면 `ip_forward=0`과 허용표·유닛을 그대로 둔 채 멈춤
 3. secrets `shred -u`, 설치 파일 삭제
 4. 유닛 중지·해제, 허용표 삭제와 부재 확인
-5. vpn-gw01의 sysctl 파일 복원(`cmp`)과 apply 전 런타임 `ip_forward` 값 복원(readback)
+5. vpn-gw01의 sysctl 파일 복원(`cmp`)
 6. 이 RUN에서 추가한 firewalld 항목만 제거
 7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable
+8. **위 정리가 모두 성공했을 때만** apply 전 런타임 `ip_forward` 값 복원(readback). 그 전까지와 실패 시에는 0 유지
 
-단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 `check`를 다시 출력합니다.
+단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, `ip_forward=0`과 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 `check`를 다시 출력합니다.
 
 ## 증적
 
@@ -181,7 +182,7 @@ P2VPN_CONTAINER_IT=1 python3 -m unittest discover -s p2-vpn-01/tests -v
     - 유닛이 실패하면 포워딩이 꺼진 채로 남고 conn도 등록하지 않음(기존 런타임 `ip_forward=1`이어도 0으로 확인)
     - 백업 실패는 호스트 변경 전 중단, 설치 단계 실패는 `APPLY_OK` 없이 중단 후 rollback으로 원상 복구
     - 활성 RUN·기존 설치가 있으면 새 RUN apply를 무변경 거부, 다른 RUN의 rollback 거부
-    - rollback 필수 단계(ip_forward 원복, firewalld 제거 등)가 실패하면 `ROLLBACK_INCOMPLETE`·nonzero이고 다시 실행할 수 있음. `ip_forward=0` 확인에 실패하면 허용표를 지우지 않음
+    - rollback 필수 단계(conn 삭제·조회, 유닛 중지, firewalld 제거, ip_forward 원복 등)가 실패하면 `ROLLBACK_INCOMPLETE`·nonzero, `ip_forward=0` 유지, 다시 실행할 수 있음. `ip_forward=0` 확인에 실패하면 허용표를 지우지 않음
     - 실패 주입: 가짜 명령에 `FAKE_FAIL`(glob)로 특정 호출만 rc1
     - firewalld는 바뀐 것이 있을 때만 reload
     - vpn-gw01 영구 sysctl은 0으로 바뀌고 원복하면 원래 값으로 돌아감

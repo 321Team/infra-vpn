@@ -445,10 +445,63 @@ class FakeHostTests(unittest.TestCase):
         self.assertNotEqual(fw.returncode, 0)
         self.assertIn("zone forward 제거 실패", fw.stderr)
         self.assertNotIn("ROLLBACK_DONE", fw.stdout)
+        self.assertEqual(self.st("ip_forward"), "0", "정리 실패 시 0 유지")
         final = self.run_cmd("relay", "rollback", "20261012T1510")
         self.assertEqual(final.returncode, 0, final.stderr + final.stdout)
         self.assertEqual((self.st("ip_forward"), self.st("nft_table"), self.st("fw_forward")), ("0", "absent", "no"))
         self.assertEqual(self.st("fw_ports"), "")
+
+    def test_r4b_cleanup_failures_keep_forwarding_off_and_controls(self):
+        """조회·삭제·중지·방화벽 실패: rc!=0, 성공표식 없음, ACTIVE 유지, ip_forward=0. 같은 RUN 재시도 성공."""
+        cases = (
+            ("ipsec delete fds-p2-vpn", "conn 삭제 실패", True),
+            ("ipsec status", "conn 조회 실패", True),
+            ("systemctl is-active ipsec", "ipsec.service 상태 불확실", True),
+            ("systemctl disable --now fds-p2-vpn-forward.service", "유닛 중지·해제 실패", False),
+        )
+        n = 0
+        for role, orig in (("relay", 0), ("vpn-gw01", 1)):
+            for pattern, msg, controls_kept in cases:
+                n += 1
+                self.setUp()
+                self.host(role, orig, fw_forward="yes")
+                self.psk(role)
+                run = f"20261012T16{n:02d}"
+                self.assertEqual(self.run_cmd(role, "apply", run).returncode, 0, (role, pattern))
+                bad = self.run_cmd(role, "rollback", run, FAKE_FAIL=pattern)
+                ctx = (role, pattern, bad.stdout, bad.stderr)
+                self.assertNotEqual(bad.returncode, 0, ctx)
+                self.assertNotIn("ROLLBACK_DONE", bad.stdout, ctx)
+                self.assertIn(msg, bad.stderr, ctx)
+                self.assertEqual(self.st("ip_forward"), "0", ctx)
+                self.assertEqual(self.active(), run, ctx)
+                if controls_kept:
+                    self.assertEqual(self.st("nft_table"), "present", ctx)
+                    self.assertTrue((self.state / "conn_added").exists(), ctx)
+                    self.assertTrue((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists(), ctx)
+                again = self.run_cmd(role, "rollback", run)
+                self.assertEqual(again.returncode, 0, (role, pattern, again.stderr, again.stdout))
+                self.assertIn("ROLLBACK_DONE", again.stdout)
+                self.assertEqual((self.st("ip_forward"), self.st("nft_table")), (str(orig), "absent"), (role, pattern))
+                self.assertFalse((self.state / "conn_added").exists(), (role, pattern))
+                self.assertEqual(self.active(), "", (role, pattern))
+
+    def test_r4b_conn_absent_and_ipsec_inactive_are_not_failures(self):
+        self.host("relay", 0)
+        self.psk("relay")
+        self.assertEqual(self.run_cmd("relay", "apply", "20261012T1700").returncode, 0)
+        (self.state / "conn_added").unlink()  # 조회 성공·등록 없음
+        done = self.run_cmd("relay", "rollback", "20261012T1700")
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("conn: 등록 없음(조회 확인)", done.stdout)
+        self.setUp()
+        self.host("relay", 0)
+        self.psk("relay")
+        self.assertEqual(self.run_cmd("relay", "apply", "20261012T1701").returncode, 0)
+        (self.state / "ipsec").write_text("inactive\n")  # ipsec.service가 내려가 있으면 conn 적재 없음
+        done = self.run_cmd("relay", "rollback", "20261012T1701")
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertIn("ipsec.service: inactive", done.stdout)
 
 
 @unittest.skipUnless(os.environ.get("P2VPN_CONTAINER_IT") == "1" and shutil.which("docker"),
