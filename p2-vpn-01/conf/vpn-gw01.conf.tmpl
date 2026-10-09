@@ -1,0 +1,29 @@
+# P2-VPN-01 (#37) — On-Prem vpn-gw01 (10.1.93.51) 쪽 conn. 개시자(initiator).
+# 설치 위치: /etc/ipsec.d/fds-p2-vpn.conf. PSK는 /etc/ipsec.d/fds-p2-vpn.secrets(0600)에 세션에서만 입력한다.
+# IKEv2 지정 줄(아래 자리표시자)은 Libreswan 버전별 문법으로 바뀐다(5.x: keyexchange=ikev2, 4.x: ikev2=insist). 의미는 "IKEv2만".
+conn fds-p2-vpn
+	@@IKEV2@@
+	authby=secret
+	# 교육장 공인 IP가 교환 중에도 바뀌므로 출발지 IP가 아니라 IKE ID로 서로를 확인한다.
+	left=10.1.93.51
+	leftid=@fds-vpn-gw01
+	leftsubnet=10.1.93.0/24
+	right=@@RELAY_EIP@@
+	rightid=@fds-aws-relay01
+	rightsubnet=10.20.0.0/16
+	# 양쪽 제안을 고정한다(버전 기본값 차이로 협상이 갈리지 않게). ESP의 DH는 PFS 그룹이다.
+	ike=aes256-sha2_256;modp2048
+	esp=aes256-sha2_256;modp2048
+	# rekey는 개시자(vpn-gw01)가 먼저 하도록 수명을 Relay보다 짧게 둔다.
+	ikelifetime=7h
+	salifetime=50m
+	rekey=yes
+	# rekey 시점 = 수명 - rekeymargin×(1~2) (fuzz 100%). vpn-gw01 50m → 32~41분, Relay 1h → 42~51분: vpn-gw01이 먼저.
+	rekeymargin=9m
+	rekeyfuzz=100%
+	# IKEv2 liveness: 30초마다 확인, 120초 응답 없으면 SA를 내리고 auto=start로 다시 세운다.
+	dpddelay=30s
+	retransmit-timeout=120s
+	# 양쪽 모두 NAT 뒤(교육장 NAT, AWS EIP 1:1 NAT)라 UDP/4500 캡슐화가 협상된다. keepalive 기본 20초.
+	encapsulation=auto
+	auto=start

@@ -1,0 +1,27 @@
+# P2-VPN-01 (#37) — AWS Relay (10.20.110.10, EIP 1:1 NAT) 쪽 conn. 응답자(responder)만 한다.
+# 설치 위치: /etc/ipsec.d/fds-p2-vpn.conf. PSK는 /etc/ipsec.d/fds-p2-vpn.secrets(0600)에 SSM 세션에서만 입력한다.
+# IKEv2 지정 줄(아래 자리표시자)은 Libreswan 버전별 문법으로 바뀐다(5.x: keyexchange=ikev2, 4.x: ikev2=insist).
+conn fds-p2-vpn
+	@@IKEV2@@
+	authby=secret
+	left=%defaultroute
+	leftid=@fds-aws-relay01
+	leftsubnet=10.20.0.0/16
+	# 교육장 공인 IP는 두 개를 오가고 교환 중에도 바뀐다. 주소가 아니라 IKE ID(@fds-vpn-gw01)로만 받는다.
+	right=%any
+	rightid=@fds-vpn-gw01
+	rightsubnet=10.1.93.0/24
+	ike=aes256-sha2_256;modp2048
+	esp=aes256-sha2_256;modp2048
+	# vpn-gw01(7h/50m)보다 길게 두어 rekey를 vpn-gw01이 먼저 하게 한다.
+	ikelifetime=8h
+	salifetime=1h
+	rekey=yes
+	# rekey 시점 = 수명 - rekeymargin×(1~2) (fuzz 100%). vpn-gw01 50m → 32~41분, Relay 1h → 42~51분: vpn-gw01이 먼저.
+	rekeymargin=9m
+	rekeyfuzz=100%
+	dpddelay=30s
+	retransmit-timeout=120s
+	encapsulation=auto
+	# 응답만 한다. Relay에서 IKE를 시작하지 않으며 SG에도 UDP egress가 없다.
+	auto=add

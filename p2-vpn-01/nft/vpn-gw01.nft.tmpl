@@ -1,0 +1,28 @@
+# P2-VPN-01 (#37) — vpn-gw01 host FORWARD 허용표. /etc/fds-p2-vpn/forward.nft
+# 10.20.0.0/16(VPC)이 관련된 포워딩만 판정하고, 그 밖의 포워딩은 기존 동작(firewalld)에 맡긴다.
+# 이 표가 올라온 뒤에만 fds-p2-vpn-forward.service가 ip_forward=1을 켠다(fail-closed).
+table inet fds_p2_vpn
+delete table inet fds_p2_vpn
+table inet fds_p2_vpn {
+	chain forward {
+		type filter hook forward priority filter + 10; policy accept;
+		ip saddr 10.20.0.0/16 jump from_vpc
+		ip daddr 10.20.0.0/16 jump to_vpc
+	}
+
+	# VPC → On-Prem: 터널에서 복호화된 패킷만, 승인된 목적지·포트의 새 연결만.
+	chain from_vpc {
+		meta ipsec missing counter drop comment "복호화되지 않은 패킷 - 평문 위장 차단"
+		ct state established,related accept
+		ip saddr 10.20.10.0/24 ip daddr 10.1.93.55 tcp dport 5432 ct state new counter accept comment "worker -> db01 5432"
+@@HARBOR@@
+		counter drop comment "승인 밖 출발지·목적지·포트"
+	}
+
+	# On-Prem → VPC: 응답만, 반드시 터널로. SA가 없으면 교육장 게이트웨이로 평문이 나가지 않게 버린다.
+	chain to_vpc {
+		rt ipsec missing counter drop comment "SA 없음 - 평문 우회 차단"
+		ct state established,related accept
+		counter drop comment "On-Prem 개시 새 연결"
+	}
+}
