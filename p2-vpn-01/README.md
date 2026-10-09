@@ -148,13 +148,15 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 
 ## 원복
 
+`apply`는 파일·표식이 없어도 포워딩 유닛이 active·enabled로 남아 있으면 거부하고, firewalld 원래 상태를 조회하지 못하면 호스트를 바꾸기 전에 멈춥니다(원래 상태를 "없음"으로 잘못 기록하지 않도록).
+
 `sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일(활성 RUN과 다른 RUN이면 거부):
 1. **먼저 `ip_forward=0`을 readback으로 확인.** 확인되지 않으면 허용표·유닛을 건드리지 않고 멈춤
 2. conn: `ipsec status`로 등록·없음·**조회 실패**를 구분. 삭제 실패·삭제 뒤 부재 확인 실패·조회 실패·`ipsec.service` 상태 불확실이면 `ip_forward=0`과 허용표·유닛을 그대로 둔 채 멈춤
 3. secrets `shred -u`, 설치 파일 삭제
-4. 유닛 중지·해제, 허용표 삭제와 부재 확인
+4. 유닛: **파일 존재가 아니라 `is-active`·`is-enabled` 조회로** 판단. 살아 있으면 중지·해제하고 `inactive`·`enabled 아님`을 다시 확인. 조회·중지·확인이 실패하면 유닛·허용표 파일과 활성 RUN 표식을 그대로 두고 멈춤(같은 RUN 재시도가 중지 단계를 다시 수행). 그 뒤 파일 삭제, 허용표 삭제와 부재 확인
 5. vpn-gw01의 sysctl 파일 복원(`cmp`)
-6. 이 RUN에서 추가한 firewalld 항목만 제거
+6. 이 RUN에서 추가한 firewalld 항목만 제거. permanent 조회를 있음·없음·**조회 오류**로 나누고, 제거 뒤 부재를 다시 확인. 조회 오류는 실패로 남김
 7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable
 8. **위 정리가 모두 성공했을 때만** apply 전 런타임 `ip_forward` 값 복원(readback). 그 전까지와 실패 시에는 0 유지
 

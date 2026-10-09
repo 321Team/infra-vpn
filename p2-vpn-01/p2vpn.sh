@@ -185,6 +185,32 @@ apply_fail() {
 }
 ACTIVE=$STATE_ROOT/ACTIVE_RUN
 
+# firewalld permanent 조회: 0=있음, 1=없음, 2=조회 오류(없음으로 보지 않는다). 호출한 함수의 $zone을 쓴다.
+fw_has() {
+  firewall-cmd --permanent --zone "$zone" "$@" > /dev/null 2>&1
+  case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+fw_yesno() {
+  fw_has "$@"
+  case $? in 0) echo yes ;; 1) echo no ;; *) echo ERR ;; esac
+}
+
+# 포워딩 유닛 상태를 조회로 읽는다(파일 존재로 판단하지 않는다).
+# 결과: UNIT_ACT(active|inactive|...), UNIT_EN(enabled|disabled|not-found|...). 조회 불가면 rc2.
+unit_state() {
+  UNIT_ACT=$(systemctl is-active "$UNIT" 2>/dev/null)
+  UNIT_EN=$(systemctl is-enabled "$UNIT" 2>/dev/null)
+  if [ -z "$UNIT_EN" ] && [ ! -e "$UNIT_FILE" ]; then UNIT_EN=not-found; fi
+  case "$UNIT_ACT" in active|activating|deactivating|reloading|inactive|failed|unknown) ;; *) return 2 ;; esac
+  case "$UNIT_EN" in enabled|enabled-runtime|disabled|static|masked|linked|linked-runtime|indirect|generated|not-found) ;; *) return 2 ;; esac
+  return 0
+}
+unit_stopped() {
+  case "$UNIT_ACT" in inactive|failed|unknown) ;; *) return 1 ;; esac
+  case "$UNIT_EN" in enabled|enabled-runtime) return 1 ;; esac
+  return 0
+}
+
 do_apply() {
   need_root; identity_check
   local run=${1:-}; [[ "$run" =~ ^[0-9]{8}T[0-9]{4}$ ]] || die "RUN 형식 YYYYMMDDTHHMM 필요"
@@ -196,6 +222,9 @@ do_apply() {
     [ -e "$f" ] && die "기존 설치 존재 — 소유 RUN 원복·확인 후 재시도: $f"
   done
   nft list table inet fds_p2_vpn > /dev/null 2>&1 && die "기존 fds_p2_vpn table 존재 — 소유 RUN 확인 필요"
+  # 파일이 없어도 이전 RUN의 유닛이 살아 있거나 부팅 링크가 남아 있으면 덮어쓰지 않는다.
+  unit_state || die "포워딩 유닛 상태 조회 실패('$UNIT_ACT'/'$UNIT_EN') — 설치 중단"
+  unit_stopped || die "포워딩 유닛이 남아 있음($UNIT_ACT/$UNIT_EN) — 소유 RUN 원복·확인 후 재시도"
   mkdir -p "$dir/backup" "$dir/staged" || die "state 디렉터리 생성 실패"
   chmod 700 "$STATE_ROOT" "$dir" || die "state 디렉터리 권한 설정 실패"
   render "$dir/staged" || die "render 실패"
@@ -215,13 +244,16 @@ do_apply() {
   fwd=$(sysctl -n net.ipv4.ip_forward) || die "ip_forward 조회 실패"
   [[ "$fwd" =~ ^[01]$ ]] || die "ip_forward 값 이상: '$fwd'"
   ipsec_active=$(systemctl is-active ipsec 2>/dev/null); ipsec_enabled=$(systemctl is-enabled ipsec 2>/dev/null)
+  # firewalld 원래 상태: 조회 오류를 "없음"으로 기록하면 rollback이 원래 있던 항목을 지우므로 여기서 멈춘다.
+  local zf p500 p4500
+  zf=$(fw_yesno --query-forward); p500=$(fw_yesno --query-port 500/udp); p4500=$(fw_yesno --query-port 4500/udp)
+  case "$zf $p500 $p4500" in *ERR*) die "firewalld 원래 상태 조회 실패(forward=$zf 500=$p500 4500=$p4500) — 설치 중단" ;; esac
   {
     echo "zone=$zone"
     echo "ip_forward_runtime=$fwd"
-    echo "zone_forward=$(firewall-cmd --permanent --zone "$zone" --query-forward > /dev/null && echo yes || echo no)"
-    for p in 500/udp 4500/udp; do
-      echo "port_${p%/udp}=$(firewall-cmd --permanent --zone "$zone" --query-port "$p" > /dev/null && echo yes || echo no)"
-    done
+    echo "zone_forward=$zf"
+    echo "port_500=$p500"
+    echo "port_4500=$p4500"
     echo "ipsec_active=${ipsec_active:-unknown}"
     echo "ipsec_enabled=${ipsec_enabled:-unknown}"
   } > "$dir/state.env" || die "state.env 기록 실패 — 설치 중단"
@@ -244,16 +276,22 @@ do_apply() {
   local changed=no
   if [ "$ROLE" = relay ]; then
     for p in 500/udp 4500/udp; do
-      if ! firewall-cmd --permanent --zone "$zone" --query-port "$p" > /dev/null; then
-        firewall-cmd --permanent --zone "$zone" --add-port "$p" > /dev/null || apply_fail "port $p 추가 실패"
-        changed=yes
-      fi
+      fw_has --query-port "$p"
+      case $? in
+        0) ;;
+        1) firewall-cmd --permanent --zone "$zone" --add-port "$p" > /dev/null || apply_fail "port $p 추가 실패"
+           changed=yes ;;
+        *) apply_fail "port $p 조회 실패" ;;
+      esac
     done
   fi
-  if ! firewall-cmd --permanent --zone "$zone" --query-forward > /dev/null; then
-    firewall-cmd --permanent --zone "$zone" --add-forward > /dev/null || apply_fail "zone forward 허용 실패"
-    changed=yes
-  fi
+  fw_has --query-forward
+  case $? in
+    0) ;;
+    1) firewall-cmd --permanent --zone "$zone" --add-forward > /dev/null || apply_fail "zone forward 허용 실패"
+       changed=yes ;;
+    *) apply_fail "zone forward 조회 실패" ;;
+  esac
   echo "firewalld_changed=$changed" >> "$dir/state.env" || apply_fail "state.env 갱신 실패"
   if [ "$changed" = yes ]; then firewall-cmd --reload > /dev/null || apply_fail "firewalld reload 실패"; fi
   echo "firewalld_changed=$changed"
@@ -349,11 +387,17 @@ do_rollback() {
   if [ -e "$SECRETS" ]; then shred -u "$SECRETS" 2>/dev/null || rm -f "$SECRETS" || fail "secrets 삭제 실패"; fi
   [ -e "$SECRETS" ] && fail "secrets가 남아 있음"
 
-  # 3) 유닛·허용표
-  if [ -e "$UNIT_FILE" ]; then
-    systemctl disable --now "$UNIT" > /dev/null 2>&1 || fail "유닛 중지·해제 실패"
-    rm -f "$UNIT_FILE" || fail "$UNIT_FILE 삭제 실패"
+  # 3) 유닛: 파일 존재가 아니라 조회 상태로 판단한다. 중지·해제나 그 확인이 실패하면 유닛·허용표 파일과
+  #    ACTIVE를 그대로 두고 멈춘다(파일을 지우면 같은 RUN 재시도가 중지 단계를 건너뛰게 된다).
+  unit_state || die "유닛 상태 조회 실패('$UNIT_ACT'/'$UNIT_EN') — ip_forward=0, 유닛·허용표 파일·ACTIVE 보존, 같은 RUN으로 재시도"
+  if ! unit_stopped; then
+    systemctl disable --now "$UNIT" > /dev/null 2>&1 ||
+      die "유닛 중지·해제 실패 — ip_forward=0, 유닛·허용표 파일·ACTIVE 보존, 같은 RUN으로 재시도"
+    unit_state || die "유닛 상태 재조회 실패 — ip_forward=0, 유닛·허용표 파일·ACTIVE 보존, 같은 RUN으로 재시도"
+    unit_stopped || die "유닛이 아직 $UNIT_ACT/$UNIT_EN — ip_forward=0, 유닛·허용표 파일·ACTIVE 보존, 같은 RUN으로 재시도"
   fi
+  echo "유닛: $UNIT_ACT/$UNIT_EN 확인"
+  if [ -e "$UNIT_FILE" ]; then rm -f "$UNIT_FILE" || fail "$UNIT_FILE 삭제 실패"; fi
   if [ -e "$NFT_FILE" ]; then rm -f "$NFT_FILE" || fail "$NFT_FILE 삭제 실패"; fi
   [ -d "$NFT_DIR" ] && { rmdir "$NFT_DIR" 2>/dev/null || true; }
   systemctl daemon-reload || fail "daemon-reload 실패"
@@ -374,16 +418,36 @@ do_rollback() {
   # 런타임 ip_forward는 모든 정리·확인이 끝난 뒤(아래)에만 apply 전 값으로 되돌린다. 그 전까지 0 유지.
 
   # 5) 이 RUN에서 추가한 firewalld 항목만 제거
+  #    있음·없음·조회 오류를 구분하고, 제거 뒤 부재를 다시 확인한다. 오류는 실패로 남겨 ip_forward=0·ACTIVE를 유지한다.
   if [ "$ROLE" = relay ]; then
     for p in 500 4500; do
       eval "b=\${port_$p:-no}"
-      if [ "$b" = no ] && firewall-cmd --permanent --zone "$zone" --query-port "$p/udp" > /dev/null; then
-        firewall-cmd --permanent --zone "$zone" --remove-port "$p/udp" > /dev/null || fail "port $p/udp 제거 실패"
-      fi
+      [ "$b" = no ] || continue
+      fw_has --query-port "$p/udp"
+      case $? in
+        0) if firewall-cmd --permanent --zone "$zone" --remove-port "$p/udp" > /dev/null; then
+             fw_has --query-port "$p/udp"
+             [ $? = 1 ] || fail "port $p/udp 제거 뒤 부재 확인 실패"
+           else
+             fail "port $p/udp 제거 실패"
+           fi ;;
+        1) : ;;
+        *) fail "port $p/udp 조회 실패" ;;
+      esac
     done
   fi
-  if [ "${zone_forward:-yes}" = no ] && firewall-cmd --permanent --zone "$zone" --query-forward > /dev/null; then
-    firewall-cmd --permanent --zone "$zone" --remove-forward > /dev/null || fail "zone forward 제거 실패"
+  if [ "${zone_forward:-yes}" = no ]; then
+    fw_has --query-forward
+    case $? in
+      0) if firewall-cmd --permanent --zone "$zone" --remove-forward > /dev/null; then
+           fw_has --query-forward
+           [ $? = 1 ] || fail "zone forward 제거 뒤 부재 확인 실패"
+         else
+           fail "zone forward 제거 실패"
+         fi ;;
+      1) : ;;
+      *) fail "zone forward 조회 실패" ;;
+    esac
   fi
   if [ "${firewalld_changed:-no}" = yes ]; then firewall-cmd --reload > /dev/null || fail "firewalld reload 실패"; fi
 

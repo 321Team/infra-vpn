@@ -5,10 +5,10 @@ set -u
 S=${FAKE_STATE:?}
 name=$(basename "$0")
 printf '%s %s\n' "$name" "$*" >> "$S/calls.log"
-# 실패 주입: FAKE_FAIL(glob)이 "명령 인자" 전체와 맞으면 아무것도 바꾸지 않고 rc1.
+# 실패 주입: FAKE_FAIL(glob)이 "명령 인자" 전체와 맞으면 아무것도 바꾸지 않고 rc(FAKE_FAIL_RC, 기본 1).
 if [ -n "${FAKE_FAIL:-}" ]; then
   # shellcheck disable=SC2053
-  [[ "$name $*" == $FAKE_FAIL ]] && { echo "fake: injected failure: $name $*" >&2; exit 1; }
+  [[ "$name $*" == $FAKE_FAIL ]] && { echo "fake: injected failure: $name $*" >&2; exit "${FAKE_FAIL_RC:-1}"; }
 fi
 get() { cat "$S/$1" 2>/dev/null || echo "${2:-}"; }
 put() { printf '%s\n' "$2" > "$S/$1"; }
@@ -66,14 +66,15 @@ case "$name" in
     unit=fds-p2-vpn-forward.service
     case "$*" in
       daemon-reload) exit 0 ;;
-      "enable $unit") put unit_enabled yes ;;
+      "enable $unit") put unit_enabled enabled ;;
       "restart $unit")
         [ "${FAKE_UNIT_FAIL:-}" = 1 ] && exit 1
         [ -f "${FAKE_NFT_FILE:?}" ] || exit 1
         put nft_table present; put unit_active active; put ip_forward 1 ;;
-      "disable --now $unit") put unit_enabled no; put unit_active inactive; put ip_forward 0; put nft_table absent ;;
-      "is-active $unit") get unit_active inactive ;;
-      "is-enabled $unit") get unit_enabled disabled ;;
+      "disable --now $unit") put unit_enabled disabled; put unit_active inactive; put ip_forward 0; put nft_table absent ;;
+      # 실제 systemctl처럼: is-active는 active일 때만 rc0(그 밖 rc3), is-enabled는 enabled일 때만 rc0
+      "is-active $unit") get unit_active inactive; [ "$(get unit_active inactive)" = active ] || exit 3 ;;
+      "is-enabled $unit") get unit_enabled disabled; [ "$(get unit_enabled disabled)" = enabled ] ;;
       "enable --now ipsec") put ipsec active; put ipsec_enabled enabled ;;
       "stop ipsec") put ipsec inactive ;;
       "disable ipsec") put ipsec_enabled disabled ;;
