@@ -88,6 +88,13 @@ class StaticContractTests(unittest.TestCase):
         start = unit.index("ExecStart=/usr/sbin/nft -f")
         self.assertLess(start, unit.index("ExecStartPost=/usr/sbin/sysctl -w net.ipv4.ip_forward=1"))
         self.assertIn("ExecStop=/usr/sbin/sysctl -w net.ipv4.ip_forward=0", unit)
+        # R1: 시작 전 0, 최초 시작 실패(ExecStop 없음)에도 ExecStopPost가 0을 확인한 뒤에만 허용표를 지운다
+        self.assertLess(unit.index("ExecStartPre=/usr/sbin/sysctl -w net.ipv4.ip_forward=0"), start)
+        post = next(line for line in unit.splitlines() if line.startswith("ExecStopPost="))
+        self.assertFalse(post.startswith("ExecStopPost=-"), "실패를 무시하지 않는다")
+        self.assertLess(post.index("ip_forward=0"), post.index("nft delete table"))
+        self.assertIn('test "$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = 0 || exit 1', post,
+                      "systemd 변수 확장을 피하려고 $$ 사용, 0 확인 실패 시 허용표를 지우지 않음")
         script = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("net.ipv4.ip_forward = 0", script, "영구 sysctl은 0, 유닛만 켠다")
 
@@ -133,7 +140,7 @@ class RenderTests(unittest.TestCase):
                           (out / "forward.nft").read_text(encoding="utf-8"))
 
 
-FAKE_TOOLS = ("id", "chown", "ip", "sysctl", "firewall-cmd", "nft", "systemctl", "ipsec")
+FAKE_TOOLS = ("id", "chown", "cp", "ip", "sysctl", "firewall-cmd", "nft", "systemctl", "ipsec")
 PSK = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6"  # 시험용 값(64자)
 
 
@@ -244,6 +251,9 @@ class FakeHostTests(unittest.TestCase):
         self.assertEqual((self.st("ip_forward"), self.st("nft_table"), self.st("fw_forward")), ("0", "absent", "no"))
         self.assertEqual(self.st("fw_ports"), "")
         self.assertFalse((self.state / "conn_added").exists())
+        self.assertEqual((self.st("ipsec"), self.st("ipsec_enabled")), ("inactive", "disabled"),
+                         "apply 전 꺼져 있던 ipsec.service로 되돌림")
+        self.assertFalse((self.prefix / "root/fds-p2-vpn/ACTIVE_RUN").exists())
 
     def test_vpn_gw01_apply_makes_persistent_forwarding_fail_closed_and_rollback_restores(self):
         self.host("vpn-gw01", 1, fw_forward="yes")
@@ -306,6 +316,139 @@ class FakeHostTests(unittest.TestCase):
             self.assertNotIn(secret, status.stdout, "xfrm 키·SPI 긴 값은 가린다")
         self.assertIn("<redacted>", status.stdout)
         self.assertNotIn("auth-trunc", status.stdout)
+
+    # ---- 리뷰 R1~R4 회귀 ----
+    GW_ORIG = "net.ipv4.ip_forward=1\nnet.ipv4.conf.all.rp_filter=0\n"
+
+    def gw_file(self):
+        return self.prefix / "etc/sysctl.d/99-fds-p2-vpn-gw.conf"
+
+    def active(self):
+        path = self.prefix / "root/fds-p2-vpn/ACTIVE_RUN"
+        return path.read_text().strip() if path.exists() else ""
+
+    def test_r1_unit_start_failure_with_forwarding_already_on(self):
+        self.host("vpn-gw01", 1, fw_forward="yes")
+        self.psk("vpn-gw01")
+        done = self.run_cmd("vpn-gw01", "apply", "20261012T1300", FAKE_UNIT_FAIL="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("포워딩은 꺼진 채로 둔다", done.stderr)
+        self.assertIn("ip_forward=0 확인", done.stderr)
+        self.assertNotIn("APPLY_OK", done.stdout)
+        self.assertEqual(self.st("ip_forward"), "0", "기존 런타임 1이어도 허용표 없이 1로 남지 않는다")
+        self.assertFalse((self.state / "conn_added").exists())
+        self.assertEqual(self.active(), "20261012T1300", "실패한 RUN은 rollback 대상으로 남는다")
+        back = self.run_cmd("vpn-gw01", "rollback", "20261012T1300")
+        self.assertEqual(back.returncode, 0, back.stderr + back.stdout)
+        self.assertEqual(self.gw_file().read_text(), self.GW_ORIG)
+        self.assertEqual(self.st("ip_forward"), "1")
+
+    def test_r2_backup_failure_stops_before_host_changes(self):
+        self.host("vpn-gw01", 1, fw_forward="no")
+        self.psk("vpn-gw01")
+        done = self.run_cmd("vpn-gw01", "apply", "20261012T1310", FAKE_FAIL="cp -a *99-fds-p2-vpn-gw.conf*")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("백업 실패", done.stderr)
+        self.assertNotIn("APPLY_OK", done.stdout)
+        self.assertEqual(self.gw_file().read_text(), self.GW_ORIG, "원본 sysctl 유지")
+        self.assertEqual((self.st("ip_forward"), self.st("fw_forward")), ("1", "no"), "런타임·firewalld 그대로")
+        self.assertFalse((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists())
+        self.assertEqual(self.active(), "", "호스트 변경 전 중단이라 활성 RUN 없음")
+
+    def test_r2_install_step_failure_has_no_success_marker_and_rolls_back(self):
+        for i, pattern in enumerate(("systemctl daemon-reload", "systemctl enable fds-p2-vpn-forward.service",
+                                     "ipsec add fds-p2-vpn")):
+            if i:
+                self.setUp()
+            self.host("vpn-gw01", 1, fw_forward="yes")
+            self.psk("vpn-gw01")
+            run = f"20261012T132{i}"
+            done = self.run_cmd("vpn-gw01", "apply", run, FAKE_FAIL=pattern)
+            self.assertNotEqual(done.returncode, 0, pattern)
+            self.assertNotIn("APPLY_OK", done.stdout, pattern)
+            self.assertEqual(self.st("ip_forward"), "0", pattern)
+            self.assertEqual(self.active(), run, pattern)
+            back = self.run_cmd("vpn-gw01", "rollback", run)
+            self.assertEqual(back.returncode, 0, pattern + back.stderr + back.stdout)
+            self.assertEqual(self.gw_file().read_text(), self.GW_ORIG, pattern)
+            self.assertEqual((self.st("ip_forward"), self.st("nft_table")), ("1", "absent"), pattern)
+            self.assertEqual(self.active(), "", pattern)
+
+    def test_r3_new_run_refused_while_previous_install_exists(self):
+        self.host("vpn-gw01", 1, fw_forward="yes")
+        self.psk("vpn-gw01")
+        first = self.run_cmd("vpn-gw01", "apply", "20261012T1400")
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        conf = (self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").read_bytes()
+        calls_before = len(self.calls())
+        second = self.run_cmd("vpn-gw01", "apply", "20261012T1401")
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("활성 RUN 있음(20261012T1400)", second.stderr)
+        self.assertFalse((self.prefix / "root/fds-p2-vpn/20261012T1401").exists(), "새 RUN은 상태 폴더도 만들지 않는다")
+        self.assertEqual((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").read_bytes(), conf)
+        self.assertFalse(any(c.startswith(("systemctl restart", "firewall-cmd --permanent --zone public --add"))
+                             for c in self.calls()[calls_before:]), "거부는 무변경")
+        # 표식이 사라져도 설치 파일이 남아 있으면 덮어쓰지 않는다
+        marker = self.prefix / "root/fds-p2-vpn/ACTIVE_RUN"
+        marker.unlink()
+        third = self.run_cmd("vpn-gw01", "apply", "20261012T1402")
+        self.assertNotEqual(third.returncode, 0)
+        self.assertIn("기존 설치 존재", third.stderr)
+        marker.write_text("20261012T1400\n")
+        back = self.run_cmd("vpn-gw01", "rollback", "20261012T1400")
+        self.assertEqual(back.returncode, 0, back.stderr + back.stdout)
+        self.assertEqual((self.st("ip_forward"), self.st("nft_table")), ("1", "absent"))
+        self.assertFalse((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists())
+        self.assertEqual(self.gw_file().read_text(), self.GW_ORIG)
+
+    def test_r3_rollback_of_other_run_refused(self):
+        self.host("relay", 0)
+        self.psk("relay")
+        self.assertEqual(self.run_cmd("relay", "apply", "20261012T1410").returncode, 0)
+        other_dir = self.prefix / "root/fds-p2-vpn/20261012T1409"
+        other_dir.mkdir()
+        (other_dir / "state.env").write_text("zone=public\n")
+        other = self.run_cmd("relay", "rollback", "20261012T1409")
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("활성 RUN은 20261012T1410", other.stderr)
+        self.assertEqual(self.st("nft_table"), "present", "다른 RUN 원복 시도는 무변경")
+
+    def test_r4_rollback_failure_is_reported_and_retryable(self):
+        self.host("vpn-gw01", 1, fw_forward="yes")
+        self.psk("vpn-gw01")
+        self.assertEqual(self.run_cmd("vpn-gw01", "apply", "20261012T1500").returncode, 0)
+        bad = self.run_cmd("vpn-gw01", "rollback", "20261012T1500", FAKE_FAIL="sysctl -w net.ipv4.ip_forward=1")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("ROLLBACK_DONE", bad.stdout)
+        self.assertIn("ROLLBACK_INCOMPLETE", bad.stderr)
+        self.assertIn("ip_forward=1 원복 실패", bad.stderr)
+        self.assertEqual(self.st("ip_forward"), "0")
+        self.assertEqual(self.active(), "20261012T1500", "미완료면 활성 RUN 유지")
+        again = self.run_cmd("vpn-gw01", "rollback", "20261012T1500")
+        self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
+        self.assertIn("ROLLBACK_DONE", again.stdout)
+        self.assertEqual(self.st("ip_forward"), "1")
+        self.assertEqual(self.active(), "")
+
+    def test_r4_forwarding_off_must_succeed_before_controls_are_removed(self):
+        self.host("relay", 0)
+        self.psk("relay")
+        self.assertEqual(self.run_cmd("relay", "apply", "20261012T1510").returncode, 0)
+        bad = self.run_cmd("relay", "rollback", "20261012T1510", FAKE_FAIL="sysctl -w net.ipv4.ip_forward=0")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("허용표를 그대로 두고 중단", bad.stderr)
+        self.assertEqual(self.st("nft_table"), "present", "포워딩을 끄지 못하면 허용표를 지우지 않는다")
+        self.assertTrue((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists())
+        self.assertNotIn("ROLLBACK_DONE", bad.stdout)
+        fw = self.run_cmd("relay", "rollback", "20261012T1510",
+                          FAKE_FAIL="firewall-cmd --permanent --zone public --remove-forward")
+        self.assertNotEqual(fw.returncode, 0)
+        self.assertIn("zone forward 제거 실패", fw.stderr)
+        self.assertNotIn("ROLLBACK_DONE", fw.stdout)
+        final = self.run_cmd("relay", "rollback", "20261012T1510")
+        self.assertEqual(final.returncode, 0, final.stderr + final.stdout)
+        self.assertEqual((self.st("ip_forward"), self.st("nft_table"), self.st("fw_forward")), ("0", "absent", "no"))
+        self.assertEqual(self.st("fw_ports"), "")
 
 
 @unittest.skipUnless(os.environ.get("P2VPN_CONTAINER_IT") == "1" and shutil.which("docker"),

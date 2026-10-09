@@ -5,12 +5,18 @@ set -u
 S=${FAKE_STATE:?}
 name=$(basename "$0")
 printf '%s %s\n' "$name" "$*" >> "$S/calls.log"
+# 실패 주입: FAKE_FAIL(glob)이 "명령 인자" 전체와 맞으면 아무것도 바꾸지 않고 rc1.
+if [ -n "${FAKE_FAIL:-}" ]; then
+  # shellcheck disable=SC2053
+  [[ "$name $*" == $FAKE_FAIL ]] && { echo "fake: injected failure: $name $*" >&2; exit 1; }
+fi
 get() { cat "$S/$1" 2>/dev/null || echo "${2:-}"; }
 put() { printf '%s\n' "$2" > "$S/$1"; }
 
 case "$name" in
   id) [ "${1:-}" = -u ] && { echo 0; exit 0; }; exec /usr/bin/id "$@" ;;
   chown) exit 0 ;;
+  cp) exec /bin/cp "$@" ;;
   ip)
     case "$*" in
       "-4 -o addr show") printf '2: eth0    inet %s/24 brd x scope global eth0\n' "${FAKE_IP:?}" ;;
@@ -68,10 +74,12 @@ case "$name" in
       "disable --now $unit") put unit_enabled no; put unit_active inactive; put ip_forward 0; put nft_table absent ;;
       "is-active $unit") get unit_active inactive ;;
       "is-enabled $unit") get unit_enabled disabled ;;
-      "enable --now ipsec") put ipsec active ;;
+      "enable --now ipsec") put ipsec active; put ipsec_enabled enabled ;;
+      "stop ipsec") put ipsec inactive ;;
+      "disable ipsec") put ipsec_enabled disabled ;;
       "is-active --quiet ipsec") [ "$(get ipsec inactive)" = active ] ;;
-      "is-active ipsec") get ipsec inactive ;;
-      "is-enabled ipsec") echo enabled ;;
+      "is-active ipsec") get ipsec inactive; [ "$(get ipsec inactive)" = active ] ;;
+      "is-enabled ipsec") get ipsec_enabled disabled; [ "$(get ipsec_enabled disabled)" = enabled ] ;;
       *) exit 0 ;;
     esac ;;
   ipsec)
@@ -79,6 +87,7 @@ case "$name" in
       --version) echo "Libreswan ${FAKE_LS_VERSION:-5.4}" ;;
       "addconn --checkconfig --config "*) [ "${FAKE_CHECKCONFIG_FAIL:-}" = 1 ] && exit 1; grep -q '^conn fds-p2-vpn' "$4" ;;
       trafficstatus) [ -f "$S/conn_added" ] && echo '#1: "fds-p2-vpn", type=ESP, add_time=1, inBytes=10, outBytes=10' ;;
+      status) [ -f "$S/conn_added" ] && echo '000 "fds-p2-vpn": 10.1.93.0/24===10.1.93.51...203.0.113.10===10.20.0.0/16; unrouted'; exit 0 ;;
       showstates) echo '#1: "fds-p2-vpn":4500 STATE_V2_ESTABLISHED_CHILD_SA SPI 0xdeadbeefdeadbeefdeadbeefdeadbeef' ;;
       "add fds-p2-vpn"|"auto --add fds-p2-vpn") touch "$S/conn_added" ;;
       "delete fds-p2-vpn"|"auto --delete fds-p2-vpn") rm -f "$S/conn_added" ;;

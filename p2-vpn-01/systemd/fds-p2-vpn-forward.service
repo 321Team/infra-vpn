@@ -1,5 +1,9 @@
 # P2-VPN-01 (#37) — fail-closed 포워딩. FORWARD 허용표를 먼저 올리고, 성공했을 때만 ip_forward=1을 켠다.
 # 영구 sysctl은 ip_forward=0으로 둔다. 이 유닛이 실패하거나 멈추면 포워딩은 꺼진 채로 남는다.
+# - 시작 전(ExecStartPre)에 런타임 ip_forward=0. 기존 런타임 값이 1이어도 허용표 없이 포워딩이 남지 않는다.
+# - 최초 시작 실패에는 ExecStop이 돌지 않으므로, ExecStopPost가 먼저 ip_forward=0을 확인하고
+#   0이 확인된 뒤에만 허용표를 지운다(0 설정 실패 시 허용표를 먼저 지우지 않는다).
+# - systemd는 $를 변수로 해석하므로 셸의 $(...)는 $$(...)로 쓴다.
 [Unit]
 Description=FDS P2-VPN-01 forward allowlist then IPv4 forwarding
 After=firewalld.service network-online.target
@@ -9,11 +13,12 @@ Before=ipsec.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/usr/sbin/sysctl -w net.ipv4.ip_forward=0
 ExecStart=/usr/sbin/nft -f /etc/fds-p2-vpn/forward.nft
 ExecStart=/usr/sbin/nft list table inet fds_p2_vpn
 ExecStartPost=/usr/sbin/sysctl -w net.ipv4.ip_forward=1
 ExecStop=/usr/sbin/sysctl -w net.ipv4.ip_forward=0
-ExecStopPost=-/usr/sbin/nft delete table inet fds_p2_vpn
+ExecStopPost=/bin/sh -c '/usr/sbin/sysctl -w net.ipv4.ip_forward=0 >/dev/null || exit 1; test "$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = 0 || exit 1; if /usr/sbin/nft list table inet fds_p2_vpn >/dev/null 2>&1; then /usr/sbin/nft delete table inet fds_p2_vpn; fi'
 
 [Install]
 WantedBy=multi-user.target

@@ -109,8 +109,11 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
   - Relay: SSM 세션에 base64 붙여넣기. Relay는 사설 GitHub 저장소를 직접 받지 않습니다
 - `apply`의 동작:
   - 그 서버의 실제 Libreswan으로 `ipsec addconn --checkconfig`, `nft -c`를 통과해야 설치합니다
-  - 바뀌는 파일은 `/root/fds-p2-vpn/<RUN>/backup`에 백업합니다
+  - 바뀌는 파일은 `/root/fds-p2-vpn/<RUN>/backup`에 백업합니다. 백업·검증(`cmp`)이 실패하면 호스트를 바꾸기 전에 멈춥니다
   - firewalld는 permanent만 바꾸고, 바뀐 것이 있을 때만 reload합니다
+  - **최초 설치만 지원합니다.** 활성 RUN 표식(`/root/fds-p2-vpn/ACTIVE_RUN`)이나 기존 설치 파일·`fds_p2_vpn` 허용표가 있으면 새 RUN도 바꾸지 않고 거부합니다. 그 RUN을 `rollback`한 뒤 다시 합니다
+  - 호스트를 바꾸기 시작한 뒤의 실패(파일 쓰기·설치·SELinux 라벨·유닛·conn 등록 등)는 `APPLY_OK` 없이 멈추고, 먼저 `ip_forward=0`을 readback으로 확인합니다. 그 RUN은 활성으로 남아 `rollback <RUN>`으로 정리합니다
+  - 유닛은 시작 전(`ExecStartPre`) `ip_forward=0`을 걸고, 최초 시작 실패에도 `ExecStopPost`가 0을 확인한 뒤에만 허용표를 지웁니다
 
 ## 시험 (AC·TS 대응)
 
@@ -145,15 +148,16 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 
 ## 원복
 
-`sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일:
-1. conn 삭제
-2. secrets `shred -u`
-3. 유닛 중지·해제(`ip_forward=0`, 허용표 삭제)
-4. 설치 파일 삭제
-5. vpn-gw01의 sysctl 파일 복원과 apply 전 런타임 `ip_forward` 값 복원
+`sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일(활성 RUN과 다른 RUN이면 거부):
+1. **먼저 `ip_forward=0`을 readback으로 확인.** 확인되지 않으면 허용표·유닛을 건드리지 않고 멈춤
+2. conn이 등록돼 있을 때만 삭제하고, 삭제 뒤에도 남아 있으면 실패로 기록(이미 없음과 구분)
+3. secrets `shred -u`, 설치 파일 삭제
+4. 유닛 중지·해제, 허용표 삭제와 부재 확인
+5. vpn-gw01의 sysctl 파일 복원(`cmp`)과 apply 전 런타임 `ip_forward` 값 복원(readback)
 6. 이 RUN에서 추가한 firewalld 항목만 제거
+7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable
 
-끝나면 `check`를 다시 출력합니다.
+단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 `check`를 다시 출력합니다.
 
 ## 증적
 
@@ -174,7 +178,11 @@ P2VPN_CONTAINER_IT=1 python3 -m unittest discover -s p2-vpn-01/tests -v
   - 확인하는 것:
     - PSK가 출력·명령 인자에 나오지 않음, 0600, 줄 끝 CR 제거와 제어 문자 거부
     - 문법 검사를 통과하기 전에는 아무것도 바꾸지 않음
-    - 유닛이 실패하면 포워딩이 꺼진 채로 남고 conn도 등록하지 않음
+    - 유닛이 실패하면 포워딩이 꺼진 채로 남고 conn도 등록하지 않음(기존 런타임 `ip_forward=1`이어도 0으로 확인)
+    - 백업 실패는 호스트 변경 전 중단, 설치 단계 실패는 `APPLY_OK` 없이 중단 후 rollback으로 원상 복구
+    - 활성 RUN·기존 설치가 있으면 새 RUN apply를 무변경 거부, 다른 RUN의 rollback 거부
+    - rollback 필수 단계(ip_forward 원복, firewalld 제거 등)가 실패하면 `ROLLBACK_INCOMPLETE`·nonzero이고 다시 실행할 수 있음. `ip_forward=0` 확인에 실패하면 허용표를 지우지 않음
+    - 실패 주입: 가짜 명령에 `FAKE_FAIL`(glob)로 특정 호출만 rc1
     - firewalld는 바뀐 것이 있을 때만 reload
     - vpn-gw01 영구 sysctl은 0으로 바뀌고 원복하면 원래 값으로 돌아감
     - Libreswan 4.x는 `ipsec auto` 명령을 씀
