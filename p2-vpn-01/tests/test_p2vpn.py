@@ -61,7 +61,8 @@ class StaticContractTests(unittest.TestCase):
         # vpn-gw01이 먼저 rekey하도록 수명이 더 짧아야 한다
         self.assertLess(seconds(self.gw["ikelifetime"]), seconds(self.relay["ikelifetime"]))
         self.assertLess(seconds(self.gw["salifetime"]), seconds(self.relay["salifetime"]))
-        # rekey 시점 = 수명 - margin×(1+fuzz). vpn-gw01의 가장 늦은 rekey가 Relay의 가장 이른 rekey보다 앞서야 한다.
+        # 개시자 rekey 예정 = 수명 - margin×(1~1+fuzz). 응답자는 수명 - margin/2(Libreswan rekeyfuzz.c, NETWORK.md §3.1)로
+        # 더 늦다. 여기서는 Relay에도 개시자 식을 쓴 보수적 경우까지 vpn-gw01의 가장 늦은 rekey가 앞서는지 본다.
         for life in ("salifetime", "ikelifetime"):
             fuzz = {side: int(conf["rekeyfuzz"].rstrip("%")) / 100 for side, conf in (("gw", self.gw), ("relay", self.relay))}
             gw_latest = seconds(self.gw[life]) - seconds(self.gw["rekeymargin"])
