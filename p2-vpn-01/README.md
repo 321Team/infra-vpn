@@ -52,6 +52,8 @@
 | `systemd/fds-p2-vpn-forward.service` | `/etc/systemd/system/` |
 | `p2vpn.sh` | 실행기(`check`·`render`·`psk`·`apply`·`up`·`status`·`probe`·`rollback`) |
 | `tests/test_p2vpn.py` | 정적·렌더 시험, 가짜 호스트 흐름 시험(`tests/fakebin/`), CentOS Stream 9·10 실제 Libreswan·nftables 문법 시험 |
+| `NETWORK.md` | 설치하지 않음. #37 핵심 요구 문서: CIDR 대장·중복 검사, Route 권위(전파 없음, static 경로별 원본), 재협상(rekey)·재수립 절차 |
+| `tests/test_network_contract.py` | `NETWORK.md`의 CIDR 비중복·selector·rekey 계산이 템플릿과 같은지 보는 정적 시험 |
 
 `/etc/ipsec.d/fds-p2-vpn.secrets`는 패키지에 없습니다. 세션에서 `psk`로만 만듭니다.
 
