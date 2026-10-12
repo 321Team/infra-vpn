@@ -90,10 +90,11 @@
 
 1. 시작 전 양쪽 `sudo bash p2vpn.sh <role> status`를 기록합니다. IKE·Child SA 번호(`#n`), `trafficstatus` 바이트를 남깁니다.
 2. 자동 rekey를 기다리거나(vpn-gw01 기준 32~41분), vpn-gw01에서 수동으로 Child를 rekey합니다.
-   - `sudo ipsec whack --rekey-ipsec --name fds-p2-vpn`
+   - Child: `sudo ipsec whack --rekey-child --name fds-p2-vpn`
    - IKE: `sudo ipsec whack --rekey-ike --name fds-p2-vpn`
-   - 대상 Libreswan(vpn-gw01 5.4, Relay 4.x)에서 이 옵션이 그대로인지는 B1 `check` 때 `ipsec whack --help`로 확인합니다(**NOT VERIFIED**). 다르면 그 버전의 명령으로 바꾸고 기록합니다.
-   - 수동 rekey는 개시자(vpn-gw01)에서만 합니다. Relay는 응답자로 둡니다.
+   - 근거: vpn-gw01 `libreswan-5.4-1.el10`의 `ipsec whack --help`(2026-10-12 15:54 KST, 재환 실행)에 `rekey: whack (--rekey-ike | --rekey-child)`만 있습니다. 4.x 문서에 있던 `--rekey-ipsec`은 5.4 도움말에 없으므로 쓰지 않습니다.
+   - 수동 rekey는 개시자(vpn-gw01)에서만 합니다. Relay는 응답자로 둡니다. Relay(4.x) 쪽 rekey 명령은 쓰지 않으므로 확인 대상이 아닙니다.
+   - 실행 직전 rc와 도움말을 다시 확인합니다. 패키지 NEVRA가 바뀌었으면 도움말부터 다시 봅니다.
 3. 다시 `status`를 기록하고 시험 유형별로 판정합니다.
    - **Child rekey:** 새 Child SA가 established가 되고, 기존 Child SA가 전환 뒤 제거되는지 확인합니다.
    - **IKE rekey:** 새 IKE SA가 established가 되고, 기존 Child SA가 새 IKE SA에 인계되며, 이전 IKE SA가 제거되는지 확인합니다. Child SA 번호가 바뀌는 것은 필수 조건이 아닙니다([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)).
@@ -107,7 +108,7 @@ SA가 없을 때는 Relay의 `rt ipsec missing` drop과 fail-closed 포워딩 �
 
 | 순서 | 상황·확인 | 조치 |
 |---|---|---|
-| 1 | 양쪽 `status`, `journalctl -u ipsec --since <시각>` 수집 | 비밀이 없는 범위만 기록합니다(PSK·SPI 원문 금지. `status`는 SPI를 가림) |
+| 1 | 양쪽 `status`, `sudo journalctl -u ipsec -o short-iso-precise --since <시각> --no-pager` 수집 | 비밀이 없는 범위만 기록합니다(PSK·SPI 원문 금지. `status`는 SPI를 가림). vpn-gw01은 `ipsec.conf`에 `logfile` 설정이 없어 pluto 로그가 journal에 남습니다(2026-10-12 확인). Relay는 B1 `check` 때 같은 방법으로 확인합니다 |
 | 2 | DPD timeout(120초) 뒤 vpn-gw01 자동 재수립 | `status`로 새 SA 확인 → T3 |
 | 3 | 공인 IP 변동(교육장 두 주소) | IKE ID는 신원 확인일 뿐이며 SA endpoint·NAT 이동 처리와는 다릅니다. README T11처럼 **SA 유지 또는 DPD 뒤 재수립을 관측**하고 변동 시각·주소를 기록합니다 |
 | 4 | 자동 재수립 안 됨 | vpn-gw01 `sudo bash p2vpn.sh vpn-gw01 up` 1회 |

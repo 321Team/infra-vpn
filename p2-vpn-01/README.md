@@ -129,7 +129,7 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 | T6 | D | SA 없음 평문 차단 | `ipsec down` 뒤 T3와 같은 출발지·목적지 | 연결 실패, Relay `rt ipsec missing` 카운터 증가, Relay 외부 인터페이스에 `10.1.93.55` 평문 패킷 없음(`tcpdump`). 이어 `up` 뒤 T3 재통과 | AC6 / TS06 |
 | T7 | D | 재시작 복구 | 양쪽 `systemctl restart ipsec` | vpn-gw01이 자동으로 다시 세움, T3 재통과 | AC7 / TS06 |
 | T8 | D | 재부팅 복구 | Relay reboot, vpn-gw01 reboot, EC2 Stop→Start | 유닛이 허용표 적재 뒤 forward=1, 터널 자동 수립, T3 재통과 | AC7 / TS06 |
-| T9 | D | rekey | `ipsec whack --rekey-ipsec --name fds-p2-vpn`(또는 32~41분 관측) | 새 Child SA, 끊김 없이 T3 재통과 | AC7 / TS06 |
+| T9 | D | rekey | vpn-gw01(5.4)에서 `ipsec whack --rekey-child --name fds-p2-vpn` 또는 `--rekey-ike`(또는 32~41분 자동 관측) | Child/IKE 유형별 판정은 [NETWORK.md §3.2](NETWORK.md#32-정상-rekey-확인-t9). T3 재통과 | AC7 / TS06 |
 | T10 | B | fail-closed | `systemctl stop fds-p2-vpn-forward` | `ip_forward=0`, 허용표 없음. 다시 start하면 복구 | AC6 / TS06 |
 | T11 | D | 공인 IP 변동 | 작업창 동안 `status` 주기 기록 | SA 유지, 또는 DPD 뒤 자동 재수립. 관측값만 기록 | TS06(관측) |
 | T12 | D | 원복 | 양쪽 `rollback <RUN>` → `check` | apply 전 상태와 같음 | 복구 계약 |
