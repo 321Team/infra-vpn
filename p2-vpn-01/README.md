@@ -97,9 +97,9 @@
 ### 단계 C — 승인 경로 준비 (별도 승인)
 1. **#35:** `private_a → Relay ENI` route 활성화(`activate_onprem_routes=true`, `onprem_route_keys=["private_a"]`, 근거 = 단계 B 증적)
 2. **#35:** `private_a` 임시 시험 인스턴스 생성(계획은 #37 코멘트, 비용 판정은 #34)
-3. **DB Lead 사전 제한 시험 창(#11·#47):**
-   - db01에 `10.20.10.0/24 → 5432` 허용, `pg_hba` 1줄, 복귀 경로 `10.20.0.0/16 via 10.1.93.51`
-   - 시험 뒤 원복하고 readback합니다
+3. **DB Lead 사전 제한 시험 창(#47):**
+   - DB 사전 제한 창에서는 db01에 **runtime** rich rule(`10.20.10.0/24 → 5432`)과 **runtime** 복귀 경로(`10.20.0.0/16 via 10.1.93.51`)만 적용합니다. **pg_hba·NM 영구 설정·permanent rule은 바꾸지 않습니다.** 자격증명 없이 TCP 수립까지만 시험합니다. pg_hba `hostssl` 추가는 별도 A2 창·GO에서 합니다.
+   - 실행 도구는 infra-db `ops/p2-hyb01-rosa-db01/db01-rosa.sh`의 `pre-apply`·`pre-rollback`(병합본)입니다. 같은 RUN receipt로 원복하고 W0와 대조합니다.
    - 10/21 #47 A2를 앞당기거나 기존 P1 규칙을 넓히지 않습니다. 이 창이 없으면 T3·T6은 PENDING입니다
 
 ### 단계 D — 승인 경로 시험과 회귀
