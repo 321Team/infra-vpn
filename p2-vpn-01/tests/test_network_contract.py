@@ -37,13 +37,22 @@ def minutes(value):
 
 
 def fmt(mins):
-    return f"{mins}분" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m"
+    total_seconds = round(mins * 60)
+    hours, rest = divmod(total_seconds, 3600)
+    minutes_part, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes_part:02d}m" + (f"{secs:02d}s" if secs else "")
+    return f"{minutes_part}분" + (f"{secs}초" if secs else "")
 
 
 def rekey_range(role, life_key):
     life = minutes(setting(CONF[role], life_key))
     margin = minutes(setting(CONF[role], "rekeymargin"))
     assert setting(CONF[role], "rekeyfuzz") == "100%"
+    # Libreswan v4.15/v5.4 rekeyfuzz.c fuzz_rekey_margin(): 개시자는 margin×(1~1+fuzz), 응답자는 margin/2.
+    # 이 계약의 정상 역할: vpn-gw01 개시자, Relay 응답자(auto=add).
+    if role == "relay":
+        return life - margin / 2, life - margin / 2
     return life - 2 * margin, life - margin
 
 
@@ -81,13 +90,26 @@ class RekeyProcedureTests(unittest.TestCase):
         for role in ("vpn-gw01", "relay"):
             for key in ("salifetime", "ikelifetime"):
                 lo, hi = rekey_range(role, key)
-                if lo < 60:
+                if lo == hi:
+                    text = fmt(lo)
+                elif lo < 60:
                     text = f"{lo}~{hi}분"
                 else:
                     text = f"{fmt(lo)}~{fmt(hi)}"
                 self.assertIn(f"**{text}**", DOC, f"{role} {key}")
 
-    def test_initiator_always_rekeys_first(self):
+    def test_responder_uses_half_margin(self):
+        self.assertEqual(rekey_range("relay", "salifetime"), (55.5, 55.5))
+        self.assertEqual(rekey_range("relay", "ikelifetime"), (475.5, 475.5))
+        self.assertIn("**55분30초**", DOC)
+        self.assertIn("**7h55m30s**", DOC)
+
+    def test_rekey_success_split_by_type(self):
+        self.assertIn("**Child rekey:**", DOC)
+        self.assertIn("**IKE rekey:**", DOC)
+        self.assertIn("RFC 7296 §2.8", DOC)
+
+    def test_normal_timer_initiator_rekeys_first(self):
         for key in ("salifetime", "ikelifetime"):
             _, gw_hi = rekey_range("vpn-gw01", key)
             relay_lo, _ = rekey_range("relay", key)

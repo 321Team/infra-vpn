@@ -50,7 +50,7 @@
 
 | # | 경로 | 위치 | 권위 원본 | 변경 주체·승인 | 현재(2026-10-12) |
 |---|---|---|---|---|---|
-| R1 | public `0.0.0.0/0 → IGW`, private `0.0.0.0/0 → NAT` | VPC route table 4개 | infra-terraform `terraform/network` | #35 IaC 실행 Lead 이하영, network Apply GO | network Apply 진행 중(infra-terraform#11) |
+| R1 | public `0.0.0.0/0 → IGW`, private `0.0.0.0/0 → NAT` | VPC route table 4개 | infra-terraform `terraform/network`(source `81162467`) | #35 IaC 실행 Lead 이하영, network Apply GO | 생산자 보고: Apply 완료·readback 20/20 PASS(2026-10-12 10:47 KST, [#11 6116326502](https://github.com/321Team/infra-terraform/issues/11#issuecomment-6116326502)). 독립 readback 검토와 Stage-A 완료는 별도 |
 | R2 | `private_a`: `10.1.93.0/24 → Relay ENI` | `private_a` route table | infra-terraform `terraform/vpn` `aws_route.onprem`(`activate_onprem_routes`, `onprem_route_keys=["private_a"]`만 허용) | #35 route 승인. 근거는 README 단계 B 증적 | OFF(`activate_onprem_routes=false`) |
 | R3 | Relay가 남의 주소를 전달할 수 있음 | Relay ENI | `terraform/vpn` `source_dest_check = false` | #35 vpn Plan·GO | 미생성 |
 | R4 | `10.1.93.0/24 <-> 10.20.0.0/16` 터널 정책 | 양쪽 커널 xfrm | 이 패키지 `conf/*.conf.tmpl`(`leftsubnet`/`rightsubnet`). Libreswan이 conn을 올릴 때 설치 | #37 이재환, README 단계 B | 미적용 |
@@ -74,17 +74,17 @@
 
 ### 3.1 설정값과 rekey 시점
 
-`conf/*.conf.tmpl` 값입니다. rekey 시점은 `수명 − rekeymargin × (1~2)`입니다(`rekeyfuzz=100%`).
+`conf/*.conf.tmpl` 값입니다. 정상 SA 역할의 시간 기반 rekey 예정값은 개시자에서 `수명 − rekeymargin × (1~2)`(`rekeyfuzz=100%`), 응답자에서 `수명 − rekeymargin / 2`입니다. Libreswan [v4.15](https://github.com/libreswan/libreswan/blob/v4.15/programs/pluto/rekeyfuzz.c)·[v5.4](https://github.com/libreswan/libreswan/blob/v5.4/programs/pluto/rekeyfuzz.c)의 `fuzz_rekey_margin()` 역할별 계산과 `ikev2_parent.c` 호출을 기준으로 합니다.
 
 | 항목 | vpn-gw01(개시자) | Relay(응답자) |
 |---|---|---|
-| Child SA 수명 | `salifetime=50m` → rekey **32~41분** | `salifetime=1h` → rekey **42~51분** |
-| IKE SA 수명 | `ikelifetime=7h` → rekey **6h42m~6h51m** | `ikelifetime=8h` → rekey **7h42m~7h51m** |
+| Child SA 수명 | `salifetime=50m` → rekey **32~41분** | `salifetime=1h` → rekey **55분30초** |
+| IKE SA 수명 | `ikelifetime=7h` → rekey **6h42m~6h51m** | `ikelifetime=8h` → rekey **7h55m30s** |
 | `rekeymargin` / `rekeyfuzz` | `9m` / `100%` | `9m` / `100%` |
 | liveness | `dpddelay=30s`, `retransmit-timeout=120s` | 같음 |
 | 끊긴 뒤 | `auto=start`로 다시 세움 | `auto=add`(응답만) |
 
-두 범위가 겹치지 않으므로 Child·IKE 모두 vpn-gw01이 먼저 rekey합니다(정적 시험에서 계산·확인).
+정상 개시자/응답자 역할과 위 수명 기준에서 시간 기반 예정값은 Child·IKE 모두 vpn-gw01이 먼저입니다(정적 시험에서 계산·확인). 이것은 타이머 예정값이며 실제 재협상 완료나 장애 중 순서를 보장하지 않습니다. 실제 타이머·SA 전환·재전송은 T9에서 확인합니다.
 
 ### 3.2 정상 rekey 확인 (T9)
 
@@ -94,10 +94,12 @@
    - IKE: `sudo ipsec whack --rekey-ike --name fds-p2-vpn`
    - 대상 Libreswan(vpn-gw01 5.4, Relay 4.x)에서 이 옵션이 그대로인지는 B1 `check` 때 `ipsec whack --help`로 확인합니다(**NOT VERIFIED**). 다르면 그 버전의 명령으로 바꾸고 기록합니다.
    - 수동 rekey는 개시자(vpn-gw01)에서만 합니다. Relay는 응답자로 둡니다.
-3. 다시 `status`를 기록합니다. 판정 기준은 다음 세 가지입니다.
-   - 새 Child SA 번호가 생기고, 이전 SA는 만료됩니다.
-   - 같은 `trafficstatus` 항목이 이어집니다.
-   - T3(승인 DB 경로)가 끊김 없이 다시 통과합니다.
+3. 다시 `status`를 기록하고 시험 유형별로 판정합니다.
+   - **Child rekey:** 새 Child SA가 established가 되고, 기존 Child SA가 전환 뒤 제거되는지 확인합니다.
+   - **IKE rekey:** 새 IKE SA가 established가 되고, 기존 Child SA가 새 IKE SA에 인계되며, 이전 IKE SA가 제거되는지 확인합니다. Child SA 번호가 바뀌는 것은 필수 조건이 아닙니다([RFC 7296 §2.8](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.8)).
+   - `trafficstatus`는 같은 conn·selector와 전후 SA의 대응 관계를 추적합니다. Child 교체 때 번호·카운터가 바뀔 수 있으므로 출력 행이나 누적 바이트 값이 같을 것을 요구하지 않습니다.
+   - T3은 승인된 단계 C/D의 DB 시험 창 안에서만 합니다. 재협상 전·중·후에 이어진 시험 시각·결과를 남기고, 관측한 구간의 연결 지속과 새 연결 재통과를 구분합니다. 전후 1회 성공만으로 중간 무중단을 판정하지 않습니다. 창이 없으면 T3은 PENDING이며, DB·route를 임의로 바꾸지 않습니다.
+4. T9 기록 양식: 시험 유형(Child/IKE, 자동/수동), 대상 버전·명령 `--help` 확인 결과, 전후 SA 번호와 대응, 시각, rc, T3 시도 시각·결과.
 
 ### 3.3 재협상 실패·끊김 대응
 
@@ -107,10 +109,10 @@ SA가 없을 때는 Relay의 `rt ipsec missing` drop과 fail-closed 포워딩 �
 |---|---|---|
 | 1 | 양쪽 `status`, `journalctl -u ipsec --since <시각>` 수집 | 비밀이 없는 범위만 기록합니다(PSK·SPI 원문 금지. `status`는 SPI를 가림) |
 | 2 | DPD timeout(120초) 뒤 vpn-gw01 자동 재수립 | `status`로 새 SA 확인 → T3 |
-| 3 | 공인 IP 변동(교육장 두 주소) | IKE ID로 확인하므로 주소 변동만으로는 실패하지 않아야 합니다. 변동 시각·주소를 기록합니다(T11) |
+| 3 | 공인 IP 변동(교육장 두 주소) | IKE ID는 신원 확인일 뿐이며 SA endpoint·NAT 이동 처리와는 다릅니다. README T11처럼 **SA 유지 또는 DPD 뒤 재수립을 관측**하고 변동 시각·주소를 기록합니다 |
 | 4 | 자동 재수립 안 됨 | vpn-gw01 `sudo bash p2vpn.sh vpn-gw01 up` 1회 |
-| 5 | 4번 실패 | 양쪽 `sudo systemctl restart ipsec`(T7 절차) → vpn-gw01이 다시 세우는지 확인 |
-| 6 | 인증 실패(PSK 불일치·교체) | rekey로는 풀리지 않습니다. 양쪽 `p2vpn.sh <role> psk`로 같은 PSK를 비표시 입력 → `rereadsecrets` → `up`. PSK 원문은 Git·Issue·PR·채팅에 쓰지 않습니다 |
+| 5 | 4번 실패 | 기존 #37 승인 작업창 안에서 양쪽 `sudo systemctl restart ipsec`(T7 절차) → vpn-gw01이 다시 세우는지 확인 |
+| 6 | 인증 실패(PSK 불일치·교체) | 기존 #37 승인 작업창 안에서만 합니다. rekey로는 풀리지 않습니다. 양쪽 `p2vpn.sh <role> psk`로 같은 PSK를 비표시 입력 → `rereadsecrets` → `up`. PSK 원문은 Git·Issue·PR·채팅에 쓰지 않습니다 |
 | 7 | 제안 불일치(`NO_PROPOSAL_CHOSEN` 등) | 양쪽 템플릿의 `ike`·`esp`가 같은지 `check`로 확인합니다. 템플릿 수정은 PR 리뷰 뒤에만 합니다 |
 | 8 | 5~7로 복구되지 않음 | 서비스 영향을 판단합니다. R2가 ON이면 #35에 OFF를 요청하고, db01 사전 창 중이면 `pre-rollback`을 합니다. 터널은 `rollback <RUN>`으로 정리하고 원인을 기록합니다 |
 
@@ -128,4 +130,6 @@ SA가 없을 때는 Relay의 `rt ipsec missing` drop과 fail-closed 포워딩 �
 `python3 -m unittest discover -s p2-vpn-01/tests -v`에 포함됩니다(`tests/test_network_contract.py`). 확인하는 내용은 다음과 같습니다.
 - §1.1 확정 대역끼리 겹치지 않음, VPC 서브넷이 VPC 안에서 서로 겹치지 않음, ROSA 문서 기본값 후보도 확정 대역과 겹치지 않음
 - 양쪽 conn 템플릿의 selector가 §1.1의 On-Prem·VPC selector와 같음, 문서에 그 값이 있음
-- 템플릿 수명·`rekeymargin`에서 계산한 rekey 범위가 §3.1 표와 같고, vpn-gw01 범위가 Relay 범위보다 항상 앞섬
+- 템플릿 수명·`rekeymargin`에서 역할별 식으로 계산한 rekey 예정값이 §3.1 표와 같음, 응답자 half-margin(Relay Child 55분30초·IKE 7h55m30s) 회귀, 정상 역할의 시간 기반 예정값에서 vpn-gw01이 Relay보다 앞섬
+
+CIDR 시험은 이 문서에 나열한 값의 비중복만 봅니다. 문서에 대역을 새로 추가할 때 시험의 목록(`FIXED`·`SUBNETS`)도 같이 고쳐야 하며, 누락을 자동으로 찾지는 않습니다.

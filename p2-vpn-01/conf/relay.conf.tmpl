@@ -17,7 +17,7 @@ conn fds-p2-vpn
 	ikelifetime=8h
 	salifetime=1h
 	rekey=yes
-	# rekey 시점 = 수명 - rekeymargin×(1~2) (fuzz 100%). vpn-gw01 50m → 32~41분, Relay 1h → 42~51분: vpn-gw01이 먼저.
+	# rekey 예정 = 개시자 수명 - rekeymargin×(1~2)(fuzz 100%), 응답자 수명 - rekeymargin/2(Libreswan rekeyfuzz.c). vpn-gw01 50m → 32~41분, Relay 1h → 55분30초: 정상 역할의 시간 기반 예정은 vpn-gw01이 먼저(NETWORK.md §3.1).
 	rekeymargin=9m
 	rekeyfuzz=100%
 	dpddelay=30s
