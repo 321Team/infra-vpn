@@ -834,6 +834,103 @@ class FakeHostTests(unittest.TestCase):
         self.assertTrue(any("rereadsecrets" in c for c in self.calls()[calls_before:]), "지운 PSK를 pluto에서도 비움")
         self.assertEqual(self.owner(), "")
 
+    # ---- PR6 재검토 5515275797 C1 잔여: 끝난 옛 RUN의 rollback은 첫 호스트 변경 전에 멈춤 ----
+    MUTATING = ("sysctl -w", "firewall-cmd --reload", "firewall-cmd --permanent --zone public --add",
+                "firewall-cmd --permanent --zone public --remove", "firewall-cmd --zone public --add",
+                "firewall-cmd --zone public --remove", "systemctl stop", "systemctl disable", "systemctl enable",
+                "systemctl start", "systemctl restart", "systemctl daemon-reload", "ipsec delete",
+                "ipsec rereadsecrets", "nft delete", "nft -f")
+
+    def mutations(self, since):
+        return [c for c in self.calls()[since:] if c.startswith(self.MUTATING)]
+
+    def test_c1_old_rollback_cannot_touch_next_runs_secrets(self):
+        self.host("vpn-gw01", 1, fw_forward="yes", ipsec_active=True)
+        (self.state / "ipsec_enabled").write_text("enabled\n")
+        a, b = "20261014T1800", "20261014T1801"
+        self.psk("vpn-gw01", a)
+        self.assertEqual(self.run_cmd("vpn-gw01", "apply", a).returncode, 0)
+        bad = self.run_cmd("vpn-gw01", "rollback", a, FAKE_FAIL="nft list tables", FAKE_FAIL_RC="2")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual((self.owner(), self.active()), (a, a), "미완료 rollback은 소유·ACTIVE 유지")
+        back = self.run_cmd("vpn-gw01", "rollback", a)
+        self.assertEqual(back.returncode, 0, back.stderr + back.stdout)
+        self.assertEqual(self.owner(), "")
+        self.psk("vpn-gw01", b)
+        fwd, gw = self.st("ip_forward"), self.gw_file().read_text()
+        for _ in range(2):
+            calls_before = len(self.calls())
+            old = self.run_cmd("vpn-gw01", "rollback", a)
+            self.assertNotEqual(old.returncode, 0, "리뷰 재현: 끝난 A의 rollback 재실행")
+            self.assertIn("이미 정리됨", old.stderr)
+            self.assertNotIn("ROLLBACK_DONE", old.stdout)
+            self.assertEqual(self.mutations(calls_before), [], "첫 호스트 변경 전에 멈춤")
+            self.assertTrue(self.secrets().exists(), "B secrets 보존")
+            self.assertEqual(self.owner(), b)
+            self.assertEqual((self.st("ip_forward"), self.gw_file().read_text()), (fwd, gw))
+        self.assertEqual(self.run_cmd("vpn-gw01", "psk-clean", b).returncode, 0)
+        calls_before = len(self.calls())
+        again = self.run_cmd("vpn-gw01", "rollback", a)
+        self.assertNotEqual(again.returncode, 0, "다음 RUN이 없어도 끝난 RUN 반복 호출은 거부")
+        self.assertEqual(self.mutations(calls_before), [])
+
+    def test_c1_rollback_refuses_run_without_ownership(self):
+        self.host("relay", 0)
+        a = "20261014T1805"
+        self.psk("relay", a)
+        self.assertEqual(self.run_cmd("relay", "apply", a).returncode, 0)
+        owner_file = self.prefix / "root/fds-p2-vpn/psk-receipts/OWNER"
+        owner_file.unlink()
+        calls_before = len(self.calls())
+        bad = self.run_cmd("relay", "rollback", a)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("소유 RUN('없음')", bad.stderr)
+        self.assertEqual(self.mutations(calls_before), [], "소유 확인 없이 자동 통과하지 않음")
+        self.assertEqual(self.active(), a)
+
+    def owner_release_blocked(self, how):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root는 권한으로 쓰기 실패를 만들 수 없음")
+        self.host("vpn-gw01", 1, fw_forward="yes", ipsec_active=True)
+        (self.state / "ipsec_enabled").write_text("enabled\n")
+        a = "20261014T1860"
+        self.psk("vpn-gw01", a)
+        self.assertEqual(self.run_cmd("vpn-gw01", "apply", a).returncode, 0)
+        target = self.receipt(a) if how == "receipt" else self.receipt(a).parent
+        mode = target.stat().st_mode
+        os.chmod(target, 0o444 if how == "receipt" else 0o555)
+        try:
+            back = self.run_cmd("vpn-gw01", "rollback", a)
+        finally:
+            os.chmod(target, mode)
+        self.assertEqual(back.returncode, 3, back.stderr + back.stdout)
+        self.assertIn("owner_release=INCOMPLETE", back.stdout)
+        self.assertIn("OWNER_RELEASE_INCOMPLETE", back.stderr)
+        self.assertEqual((self.st("ip_forward"), self.active(), self.owner()), ("1", "", a), "호스트 원복 완료·소유 유지")
+        self.assertFalse(self.secrets().exists())
+        calls_before = len(self.calls())
+        old = self.run_cmd("vpn-gw01", "rollback", a)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("psk-clean", old.stderr)
+        self.assertEqual(self.mutations(calls_before), [], "원복을 다시 하지 않음")
+        nxt = self.run_cmd("vpn-gw01", "psk", "20261014T1861", stdin=f"{PSK}\n{PSK}\n")
+        self.assertNotEqual(nxt.returncode, 0, "소유가 남아 새 RUN psk는 멈춤")
+        fin = self.run_cmd("vpn-gw01", "psk-clean", a)
+        self.assertEqual(fin.returncode, 0, fin.stderr + fin.stdout)
+        self.assertIn("소유 기록 정리만 재시도함", fin.stdout)
+        self.assertEqual(self.owner(), "")
+        self.assertEqual(self.receipt(a).read_text().count("cleaned_at="), 1)
+        self.assertEqual(self.st("ip_forward"), "1")
+        self.psk("vpn-gw01", "20261014T1861")
+        self.assertEqual(self.owner(), "20261014T1861")
+
+    def test_c1_rollback_receipt_write_failure_then_psk_clean_finishes(self):
+        self.owner_release_blocked("receipt")
+
+    @unittest.skipIf(os.name == "nt", "디렉터리 쓰기 금지로 파일 삭제 실패를 만들 수 없음(Windows)")
+    def test_c1_rollback_owner_remove_failure_then_psk_clean_finishes(self):
+        self.owner_release_blocked("dir")
+
 
 @unittest.skipUnless(os.environ.get("P2VPN_CONTAINER_IT") == "1" and shutil.which("docker"),
                      "P2VPN_CONTAINER_IT=1 과 docker 필요 — CI workflow에서 실행")

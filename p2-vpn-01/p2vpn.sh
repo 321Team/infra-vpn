@@ -4,7 +4,7 @@
 #   sudo bash p2vpn.sh <relay|vpn-gw01> check                 읽기 전용 상태
 #   bash      p2vpn.sh <relay|vpn-gw01> render <outdir>        설정 파일만 만든다(서버 변경 없음, CI·리뷰용)
 #   sudo bash p2vpn.sh <relay|vpn-gw01> psk <RUN>             PSK를 화면 표시 없이 입력해 secrets 파일(0600)에 저장
-#   sudo bash p2vpn.sh <relay|vpn-gw01> psk-clean <RUN>       apply 전(state.env 없음)에 멈춘 RUN이 만든 secrets만 지움
+#   sudo bash p2vpn.sh <relay|vpn-gw01> psk-clean <RUN>       apply 전에 멈춘 RUN이 만든 secrets만 지움(소유 기록 정리 재시도 겸용)
 #   sudo bash p2vpn.sh <relay|vpn-gw01> apply <RUN>            conn·FORWARD 허용표·fail-closed 유닛 설치, conn 등록
 #   sudo bash p2vpn.sh vpn-gw01           up                   터널 개시(개시자만)
 #   sudo bash p2vpn.sh <relay|vpn-gw01> status                SA·정책·허용표 카운터(키는 가림)
@@ -158,9 +158,10 @@ psk_owner() { cat "$PSK_OWNER" 2>/dev/null; }
 receipt_done() { [ -f "$1" ] && grep -q '^cleaned_at=' "$1"; }
 
 # 소유 해제: 정리 완료를 기록한 뒤 OWNER를 지운다. 기록·해제 실패는 OWNER를 남긴 채 nonzero.
+# 이미 cleaned_at이 있으면(앞선 해제가 OWNER 삭제에서 멈춤) 기록을 다시 쓰지 않고 OWNER만 지운다.
 release_owner() {
   local run=$1 by=$2 receipt=$PSK_RECEIPTS/$1
-  echo "cleaned_at=$(date -u +%FT%TZ) by=$by" >> "$receipt" || return 1
+  receipt_done "$receipt" || echo "cleaned_at=$(date -u +%FT%TZ) by=$by" >> "$receipt" || return 1
   rm -f "$PSK_OWNER" || return 1
   [ ! -e "$PSK_OWNER" ]
 }
@@ -233,15 +234,26 @@ do_psk() {
 
 # apply 전에 멈춘 RUN 정리: B2(psk)만 했거나 apply가 사전 검사에서 멈춰 state.env·ACTIVE가 없을 때.
 # 현재 secrets 소유 RUN(OWNER)과 같은 RUN만 지운다. 설치 흔적·조회 오류가 하나라도 있으면 멈춘다.
+# 소유 기록 정리 재시도: rollback·psk-clean이 호스트와 secrets 정리를 끝낸 뒤 소유 해제(cleaned_at·OWNER)에서
+# 멈췄다면, 같은 RUN의 psk-clean이 같은 부재 확인을 거쳐 해제만 마친다(secrets가 남아 있으면 이 경로가 아님).
 do_psk_clean() {
   need_root; identity_check
   local run=${1:-}; [[ "$run" =~ ^[0-9]{8}T[0-9]{4}$ ]] || die "RUN 형식 YYYYMMDDTHHMM 필요"
-  local receipt=$PSK_RECEIPTS/$run owner
+  local receipt=$PSK_RECEIPTS/$run owner release_only=0
   [ -e "$ACTIVE" ] && die "활성 RUN 있음($(cat "$ACTIVE" 2>/dev/null)) — 'rollback'을 사용"
-  [ -e "$STATE_ROOT/$run/state.env" ] && die "이 RUN은 apply 기록(state.env)이 있음 — 'rollback $run'을 사용"
   [ -f "$receipt" ] || die "이 RUN($run)의 secrets 생성 기록 없음 — 지우지 않음(수동 판단)"
-  receipt_done "$receipt" && die "RUN $run 은 이미 정리됨 — 현재 secrets를 변경하지 않음(소유 RUN 확인)"
   owner=$(psk_owner)
+  if receipt_done "$receipt" || [ -e "$STATE_ROOT/$run/state.env" ]; then
+    if [ "$owner" != "$run" ]; then
+      receipt_done "$receipt" && die "RUN $run 은 이미 정리됨 — 현재 secrets를 변경하지 않음(소유 RUN 확인)"
+      die "이 RUN은 apply 기록(state.env)이 있음 — 'rollback $run'을 사용"
+    fi
+    if [ -e "$SECRETS" ]; then
+      receipt_done "$receipt" && die "RUN $run 은 정리 기록이 있는데 secrets가 있음 — 변경하지 않음(수동 확인)"
+      die "이 RUN은 apply 기록(state.env)이 있음 — 'rollback $run'을 사용"
+    fi
+    release_only=1
+  fi
   [ "$owner" = "$run" ] || die "현재 secrets 소유 RUN은 '${owner:-없음}' — RUN $run 으로 지우지 않음"
   for f in "$CONF" "$NFT_FILE" "$UNIT_FILE"; do
     [ -e "$f" ] && die "설치 파일이 있음($f) — psk-clean 대상 아님, 소유 RUN rollback 확인"
@@ -278,7 +290,8 @@ do_psk_clean() {
     ipsec_cmd rereadsecrets || die "secrets 파일은 삭제됨, rereadsecrets 실패 — 소유 $run 유지, 같은 RUN으로 재시도"
     echo "rereadsecrets rc=0"
   fi
-  release_owner "$run" psk-clean || die "정리 기록·소유 해제 실패(secrets는 삭제됨) — 수동 확인"
+  release_owner "$run" psk-clean || die "정리 기록·소유 해제 실패(secrets는 삭제됨) — 원인 해소 뒤 'psk-clean $run' 재시도"
+  [ "$release_only" = 1 ] && echo "소유 기록 정리만 재시도함(secrets·설치 흔적 부재 확인)"
   echo "PSK_CLEAN_DONE role=$ROLE run=$run"
 }
 
@@ -480,6 +493,17 @@ do_rollback() {
   if [ -e "$ACTIVE" ] && [ "$(cat "$ACTIVE")" != "$run" ]; then
     die "활성 RUN은 $(cat "$ACTIVE") — 다른 RUN($run)으로 원복하지 않음"
   fi
+  # 첫 호스트 변경 전에 소유를 확인한다(PR6 재검토 5515275797 C1 잔여). 끝난 옛 RUN이 다음 RUN의 secrets를
+  # 지우거나 옛 백업으로 현재 호스트를 되돌리지 않게, 정리 완료 기록이 없고 OWNER와 RUN이 같을 때만 진행한다.
+  local owner="" receipt=$PSK_RECEIPTS/$run
+  receipt_done "$receipt" &&
+    die "RUN $run 은 이미 정리됨 — 현재 호스트를 변경하지 않음(소유 기록만 남았으면 'psk-clean $run')"
+  if [ -e "$PSK_OWNER" ]; then owner=$(cat "$PSK_OWNER") || die "secrets 소유 RUN 조회 실패 — 현재 호스트를 변경하지 않음"; fi
+  [ "$owner" = "$run" ] || die "secrets 소유 RUN('${owner:-없음}')이 원복 RUN($run)과 다름 — 현재 호스트를 변경하지 않음"
+  # ACTIVE가 없고 secrets도 없으면 이 RUN의 호스트 원복은 이미 끝났고 소유 해제만 남은 상태다.
+  if [ ! -e "$ACTIVE" ] && [ ! -e "$SECRETS" ]; then
+    die "RUN $run 의 호스트 원복은 끝났고 소유 기록 정리만 남음 — 'psk-clean $run'으로 마무리(호스트 변경 없음)"
+  fi
   # shellcheck disable=SC1091
   . "$dir/state.env"
   local failed=() b
@@ -618,9 +642,13 @@ do_rollback() {
     exit 1
   fi
   rm -f "$ACTIVE" || die "활성 RUN 표식 삭제 실패"
-  # 이 RUN이 소유한 secrets를 지웠으므로 소유를 해제한다(실패하면 OWNER가 남아 새 RUN psk가 멈춘다).
-  if [ "$(psk_owner)" = "$run" ]; then
-    release_owner "$run" rollback || echo "WARN: psk 소유 해제 실패 — 새 RUN 전 수동 확인" >&2
+  # 이 RUN이 소유한 secrets를 지웠으므로 소유를 해제한다. 실패하면 호스트 원복 완료와 소유 기록 정리 미완료를
+  # 구분해 nonzero(3)로 끝낸다. OWNER가 남아 새 RUN psk가 멈추며, 같은 RUN의 psk-clean이 부재 확인 뒤 해제를 마친다.
+  if ! release_owner "$run" rollback; then
+    echo "ROLLBACK_DONE role=$ROLE run=$run owner_release=INCOMPLETE"
+    echo "OWNER_RELEASE_INCOMPLETE run=$run — 호스트 원복은 완료, 소유 기록 정리 미완료: 원인 해소 뒤 'psk-clean $run'" >&2
+    do_check
+    exit 3
   fi
   echo "ROLLBACK_DONE role=$ROLE run=$run"
   do_check

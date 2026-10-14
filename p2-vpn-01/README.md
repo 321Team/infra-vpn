@@ -106,10 +106,12 @@
 | PSK만 생성(B2 뒤 중단) | `psk-receipts/<RUN>` 있음, `<RUN>/state.env`·활성 RUN 없음 | `sudo bash p2vpn.sh <role> psk-clean <RUN>` → `PSK_CLEAN_DONE`. secrets 부재 확인, ipsec이 떠 있으면 `rereadsecrets`로 pluto에서도 비움 |
 | apply 사전 검사에서 중단 | 위와 같음 + `<RUN>/staged`만 있고 `state.env` 없음(`rollback`은 `state.env 없음`으로 거부) | `psk-clean <RUN>`. 같은 RUN으로 다시 apply할 수 없으므로 재시도는 새 RUN |
 | apply 부분·완료 | `<RUN>/state.env`·활성 RUN 있음 | `rollback <RUN>` → `ROLLBACK_DONE`. 실패하면 `ROLLBACK_INCOMPLETE`, `ip_forward=0`·활성 RUN 보존, 같은 RUN으로 재시도 |
+| 원복은 끝났고 소유 기록 정리만 실패 | `rollback`이 rc 3, `ROLLBACK_DONE … owner_release=INCOMPLETE`와 `OWNER_RELEASE_INCOMPLETE`. 활성 RUN·secrets 없음, OWNER는 그 RUN | 원인(기록 디렉터리 권한·디스크 등) 해소 뒤 `psk-clean <RUN>` → `소유 기록 정리만 재시도함`·`PSK_CLEAN_DONE`. 같은 RUN의 `rollback`은 호스트를 다시 바꾸지 않고 거부. OWNER를 손으로 지우지 않음 |
 
 - `psk-clean`은 **현재 소유 RUN(OWNER)과 같은 RUN**이고 정리가 끝나지 않은 기록일 때만 지웁니다. 설치 파일·`fds_p2_vpn` 표·포워딩 유닛·conn 적재 중 하나라도 있으면 rollback 대상이므로 멈춥니다.
 - 조회 오류는 부재로 보지 않습니다. nft 목록 조회 실패, `ipsec.service` 상태가 active/inactive/failed의 정상 응답이 아닌 경우(조회 오류·빈 값·전환 중)는 secrets와 소유를 보존한 채 멈춥니다.
 - ipsec이 떠 있으면 파일을 지운 뒤 `rereadsecrets`로 pluto에서도 비웁니다. 실패하면 소유를 유지해 같은 RUN으로 다시 실행합니다. 소유 해제(`cleaned_at`, OWNER 삭제)는 이 확인이 끝난 뒤에만 합니다.
+- 소유 기록 정리 재시도(`psk-clean`)는 secrets가 없고, 설치 파일·허용표·유닛·conn이 없음을 위와 같은 조회로 확인한 뒤 `cleaned_at`(없을 때만)과 OWNER 삭제만 합니다. 정리 기록이 있는데 secrets가 남아 있으면 바꾸지 않고 멈춥니다.
 - 예: Relay B3 `APPLY_OK`, vpn-gw01 B4 사전 검사 실패 → Relay는 `rollback <RUN>`, vpn-gw01은 `psk-clean <RUN>`.
 
 ### 단계 C — 승인 경로 준비 (별도 승인)
@@ -170,19 +172,25 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 
 `apply`는 파일·표식이 없어도 포워딩 유닛이 active·enabled로 남아 있으면 거부하고, firewalld 원래 상태를 조회하지 못하면 호스트를 바꾸기 전에 멈춥니다(원래 상태를 "없음"으로 잘못 기록하지 않도록).
 
-`sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일(활성 RUN과 다른 RUN이면 거부):
+`sudo bash p2vpn.sh <role> rollback <RUN>`이 하는 일. **첫 호스트 변경 전에** 다음이면 거부합니다.
+- 활성 RUN과 다른 RUN
+- 정리가 끝난 RUN(`cleaned_at`) — 끝난 옛 RUN이 다음 RUN의 secrets를 지우거나 옛 백업으로 현재 호스트를 되돌리지 않게 함
+- secrets 소유 RUN(OWNER)이 없거나 RUN과 다름(OWNER 조회 실패 포함). OWNER 도입 전 설치는 자동 통과시키지 않고 원본·활성 RUN·state.env를 대조해 따로 다룸
+- 활성 RUN도 secrets도 없음 — 이 RUN의 호스트 원복은 이미 끝났고 소유 기록 정리만 남은 상태(`psk-clean <RUN>`)
+
+진행 순서:
 1. **먼저 `ip_forward=0`을 readback으로 확인.** 확인되지 않으면 허용표·유닛을 건드리지 않고 멈춤
 2. conn: `ipsec status`로 등록·없음·**조회 실패**를 구분. 삭제 실패·삭제 뒤 부재 확인 실패·조회 실패·`ipsec.service` 상태 불확실이면 `ip_forward=0`과 허용표·유닛을 그대로 둔 채 멈춤
 3. secrets `shred -u`, 설치 파일 삭제
 4. 유닛: **파일 존재가 아니라 `is-active`·`is-enabled` 조회로** 판단. 살아 있으면 중지·해제하고 `inactive`·`enabled 아님`을 다시 확인. 조회·중지·확인이 실패하면 유닛·허용표 파일과 활성 RUN 표식을 그대로 두고 멈춤(같은 RUN 재시도가 중지 단계를 다시 수행). 그 뒤 파일 삭제, 허용표 삭제와 부재 확인
 5. vpn-gw01의 sysctl 파일 복원(`cmp`)
 6. 이 RUN에서 추가한 firewalld 항목만 제거. permanent 조회를 있음·없음·**조회 오류**로 나누고, 제거 뒤 부재를 다시 확인. 조회 오류는 실패로 남김
-7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable. apply 전부터 떠 있던 ipsec은 유지하되 `rereadsecrets`로 지운 PSK를 pluto에서도 비움(실패·상태 확인 불가는 `ROLLBACK_INCOMPLETE`). 성공하면 이 RUN의 secrets 소유를 해제
+7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable. apply 전부터 떠 있던 ipsec은 유지하되 `rereadsecrets`로 지운 PSK를 pluto에서도 비움(실패·상태 확인 불가는 `ROLLBACK_INCOMPLETE`)
 8. **위 정리가 모두 성공했을 때만** apply 전 런타임 `ip_forward` 값 복원(readback). 그 전까지와 실패 시에는 0 유지
 
 허용표(`fds_p2_vpn`)는 **`nft list tables` 조회가 성공한 뒤에만** 있음·없음을 판정합니다. 조회 오류·삭제 실패·삭제 뒤 부재 확인 실패면 `ip_forward=0`과 유닛·허용표 파일·활성 RUN을 그대로 두고 멈춥니다(같은 RUN 재시도). apply도 조회 오류면 설치 전에 멈추고, 포워딩 유닛의 `ExecStopPost`도 같은 조회 오류·삭제 실패에서 nonzero로 끝납니다.
 
-단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, `ip_forward=0`과 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 `check`를 다시 출력합니다.
+단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, `ip_forward=0`과 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 소유를 해제한 뒤 `check`를 다시 출력합니다. 소유 해제만 실패하면 `ROLLBACK_DONE … owner_release=INCOMPLETE`·`OWNER_RELEASE_INCOMPLETE`를 남기고 **rc 3**으로 끝납니다(호스트 원복 완료와 구분). 이때 OWNER가 남아 새 RUN의 `psk`는 멈추며, 원인 해소 뒤 같은 RUN의 `psk-clean`이 부재를 다시 확인하고 해제를 마칩니다.
 
 ## 증적
 
@@ -215,6 +223,8 @@ P2VPN_CONTAINER_IT=1 python3 -m unittest discover -s p2-vpn-01/tests -v
     - `psk <RUN>` 생성 기록, 출처 모르는 secrets 덮어쓰기 거부, B2 뒤·apply 사전 검사 뒤 `psk-clean`으로 정리, 활성 RUN이 있으면 `psk-clean` 거부
     - 소유 RUN 결속: 끝난 RUN 기록으로 다른 RUN의 secrets를 지우거나 재사용하지 않음, PSK RUN과 다른 RUN의 apply 거부, 저장 실패 뒤 같은 RUN 재시도·정리
     - ipsec 상태 조회 오류·빈 값·전환 중이면 `psk-clean`이 secrets 보존, conn 적재 시 거부, `rereadsecrets` 실패 뒤 같은 RUN 재시도, rollback이 유지되는 ipsec에서 `rereadsecrets`
+    - 끝난 옛 RUN의 `rollback` 반복(다음 RUN psk 뒤 포함)과 소유 없는 RUN의 `rollback`이 첫 호스트 변경 전에 거부, 미완료 rollback의 소유·활성 RUN 유지와 같은 RUN 재시도
+    - rollback의 소유 해제 실패(기록 쓰기 실패·OWNER 삭제 실패)가 rc 3으로 구분되고, 같은 RUN `rollback`은 호스트를 바꾸지 않으며 `psk-clean`이 해제를 마침(OWNER 삭제 실패 재현은 Linux 비root에서만)
     - 역할과 호스트 주소가 다르면 중단
     - `status`에서 xfrm 키를 가림
 - 두 번째 명령에는 docker가 필요합니다. CentOS Stream 9·10 고정 digest에 배포판 `libreswan`·`nftables`를 설치하고 실제 문법을 검사합니다. 서버나 클러스터에는 접속하지 않습니다.
