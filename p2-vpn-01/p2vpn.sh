@@ -3,7 +3,8 @@
 #
 #   sudo bash p2vpn.sh <relay|vpn-gw01> check                 읽기 전용 상태
 #   bash      p2vpn.sh <relay|vpn-gw01> render <outdir>        설정 파일만 만든다(서버 변경 없음, CI·리뷰용)
-#   sudo bash p2vpn.sh <relay|vpn-gw01> psk                   PSK를 화면 표시 없이 입력해 secrets 파일(0600)에 저장
+#   sudo bash p2vpn.sh <relay|vpn-gw01> psk <RUN>             PSK를 화면 표시 없이 입력해 secrets 파일(0600)에 저장
+#   sudo bash p2vpn.sh <relay|vpn-gw01> psk-clean <RUN>       apply 전에 멈춘 RUN이 만든 secrets만 지움(소유 기록 정리 재시도 겸용)
 #   sudo bash p2vpn.sh <relay|vpn-gw01> apply <RUN>            conn·FORWARD 허용표·fail-closed 유닛 설치, conn 등록
 #   sudo bash p2vpn.sh vpn-gw01           up                   터널 개시(개시자만)
 #   sudo bash p2vpn.sh <relay|vpn-gw01> status                SA·정책·허용표 카운터(키는 가림)
@@ -146,8 +147,53 @@ do_check() {
   ipsec trafficstatus 2>/dev/null | grep -F "$CONN" || echo "trafficstatus: $CONN 없음"
 }
 
+# psk가 만든 secrets의 소유 기록(비밀 없음: RUN·역할·경로·시각만). apply의 RUN 디렉터리와 겹치지 않는 곳에 둔다.
+#  - receipts/<RUN>: RUN별 이력. cleaned_at이 붙은 RUN은 끝난 회차라 다시 쓰지 않는다(PR6 리뷰 C1).
+#  - OWNER: 현재 secrets를 소유한 RUN 하나. psk가 파일을 쓰기 전에 기록하고, 파일 부재(와 필요한 rereadsecrets)
+#    확인 뒤에만 지운다. apply·psk-clean·rollback·교체는 이 값과 RUN이 같을 때만 secrets를 다룬다.
+PSK_RECEIPTS=$STATE_ROOT/psk-receipts
+PSK_OWNER=$PSK_RECEIPTS/OWNER
+
+psk_owner() { cat "$PSK_OWNER" 2>/dev/null; }
+receipt_done() { [ -f "$1" ] && grep -q '^cleaned_at=' "$1"; }
+
+# 소유 해제: 정리 완료를 기록한 뒤 OWNER를 지운다. 기록·해제 실패는 OWNER를 남긴 채 nonzero.
+# 이미 cleaned_at이 있으면(앞선 해제가 OWNER 삭제에서 멈춤) 기록을 다시 쓰지 않고 OWNER만 지운다.
+release_owner() {
+  local run=$1 by=$2 receipt=$PSK_RECEIPTS/$1
+  receipt_done "$receipt" || echo "cleaned_at=$(date -u +%FT%TZ) by=$by" >> "$receipt" || return 1
+  rm -f "$PSK_OWNER" || return 1
+  [ ! -e "$PSK_OWNER" ]
+}
+
+# ipsec.service 상태를 정상 응답과 조회 오류로 나눈다. 0=active, 1=inactive/failed(정상 응답), 2=확인 불가.
+ipsec_svc_state() {
+  local svc rc=0
+  svc=$(systemctl is-active ipsec 2>/dev/null) || rc=$?
+  case "$svc:$rc" in
+    active:0) return 0 ;;
+    inactive:3|failed:3) return 1 ;;
+    *) IPSEC_SVC="$svc rc=$rc"; return 2 ;;
+  esac
+}
+
 do_psk() {
   need_root; identity_check
+  local run=${1:-}; [[ "$run" =~ ^[0-9]{8}T[0-9]{4}$ ]] || die "RUN 형식 YYYYMMDDTHHMM 필요"
+  local receipt=$PSK_RECEIPTS/$run active="" owner
+  receipt_done "$receipt" && die "RUN $run 은 이미 정리됨 — 새 RUN 사용(끝난 회차 기록을 다시 쓰지 않음)"
+  owner=$(psk_owner)
+  [ -e "$ACTIVE" ] && active=$(cat "$ACTIVE" 2>/dev/null)
+  if [ -n "$active" ]; then
+    # 설치가 살아 있으면 그 RUN의 교체만 허용한다.
+    [ "$active" = "$run" ] || die "활성 RUN은 $active — 다른 RUN($run)으로 secrets를 바꾸지 않음"
+    [ "$owner" = "$run" ] || die "secrets 소유 RUN('$owner')이 활성 RUN($run)과 다름 — 수동 확인"
+  elif [ -n "$owner" ]; then
+    # 설치 전: 이 RUN이 소유한 secrets만 다시 쓴다(부분 실패 뒤 재시도 포함).
+    [ "$owner" = "$run" ] || die "현재 secrets 소유 RUN은 $owner — 'psk-clean $owner' 뒤 새 RUN으로"
+  elif [ -e "$SECRETS" ]; then
+    die "기존 secrets가 있고 이 RUN($run)의 생성 기록이 없음 — 덮어쓰지 않음(소유 확인 필요)"
+  fi
   local a b tmp
   read -r -s -p "PSK 입력(표시 안 됨): " a; echo
   read -r -s -p "PSK 다시 입력: " b; echo
@@ -158,19 +204,95 @@ do_psk() {
   [[ "$a" =~ [[:cntrl:]] ]] && { unset a; die "PSK에 제어 문자 금지"; }
   [ "${#a}" -ge 32 ] || { unset a; die "PSK는 32자 이상"; }
   case "$a" in *'"'*|*' '*) unset a; die "PSK에 따옴표·공백 금지(base64 권장)" ;; esac
+  # 파일을 쓰기 전에 소유를 기록한다. 이후 어느 단계에서 멈춰도 이 RUN으로 정리(psk-clean)할 수 있다.
+  if [ ! -f "$receipt" ] || [ "$owner" != "$run" ]; then
+    { mkdir -p "$PSK_RECEIPTS" && chmod 700 "$STATE_ROOT" "$PSK_RECEIPTS"; } ||
+      { unset a; die "secrets 기록 디렉터리 생성 실패 — secrets 변경 없음"; }
+    if [ ! -f "$receipt" ]; then
+      { echo "run=$run"; echo "role=$ROLE"; echo "path=$SECRETS"; echo "started_at=$(date -u +%FT%TZ)"; } > "$receipt" ||
+        { unset a; die "secrets 생성 기록 실패 — secrets 변경 없음"; }
+    fi
+    echo "$run" > "$PSK_OWNER" && [ "$(psk_owner)" = "$run" ] ||
+      { unset a; die "secrets 소유 표식 기록 실패 — secrets 변경 없음"; }
+  fi
   umask 077
-  tmp=$(mktemp "$IPSEC_D/.$CONN.secrets.XXXXXX") || { unset a; die "임시 파일 생성 실패"; }
+  tmp=$(mktemp "$IPSEC_D/.$CONN.secrets.XXXXXX") || { unset a; die "임시 파일 생성 실패 — 소유 $run 유지, 'psk-clean $run'으로 정리 가능"; }
   # 쓰기·권한·교체 중 하나라도 실패하면 임시 파일을 지우고 기존 secrets는 그대로 둔다.
   if ! printf '@fds-vpn-gw01 @fds-aws-relay01 : PSK "%s"\n' "$a" > "$tmp"; then
-    unset a; rm -f "$tmp"; die "secrets 임시 파일 쓰기 실패 — 기존 secrets 유지"
+    unset a; rm -f "$tmp"; die "secrets 임시 파일 쓰기 실패 — 기존 secrets 유지, 소유 $run 유지"
   fi
   unset a
   if ! { chown root:root "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$SECRETS"; }; then
-    rm -f "$tmp"; die "secrets 저장 실패 — 기존 secrets 유지"
+    rm -f "$tmp"; die "secrets 저장 실패 — 기존 secrets 유지, 소유 $run 유지('psk-clean $run'으로 정리 가능)"
   fi
   if command -v restorecon > /dev/null 2>&1; then restorecon "$SECRETS" || die "secrets SELinux 라벨 복원 실패"; fi
+  echo "written_at=$(date -u +%FT%TZ)" >> "$receipt" || echo "WARN: 생성 시각 기록 실패(소유 $run 유지)" >&2
   secrets_report
+  echo "psk_receipt=$receipt owner=$run"
   if systemctl is-active --quiet ipsec; then ipsec_cmd rereadsecrets && echo "rereadsecrets rc=0"; fi
+}
+
+# apply 전에 멈춘 RUN 정리: B2(psk)만 했거나 apply가 사전 검사에서 멈춰 state.env·ACTIVE가 없을 때.
+# 현재 secrets 소유 RUN(OWNER)과 같은 RUN만 지운다. 설치 흔적·조회 오류가 하나라도 있으면 멈춘다.
+# 소유 기록 정리 재시도: rollback·psk-clean이 호스트와 secrets 정리를 끝낸 뒤 소유 해제(cleaned_at·OWNER)에서
+# 멈췄다면, 같은 RUN의 psk-clean이 같은 부재 확인을 거쳐 해제만 마친다(secrets가 남아 있으면 이 경로가 아님).
+do_psk_clean() {
+  need_root; identity_check
+  local run=${1:-}; [[ "$run" =~ ^[0-9]{8}T[0-9]{4}$ ]] || die "RUN 형식 YYYYMMDDTHHMM 필요"
+  local receipt=$PSK_RECEIPTS/$run owner release_only=0
+  [ -e "$ACTIVE" ] && die "활성 RUN 있음($(cat "$ACTIVE" 2>/dev/null)) — 'rollback'을 사용"
+  [ -f "$receipt" ] || die "이 RUN($run)의 secrets 생성 기록 없음 — 지우지 않음(수동 판단)"
+  owner=$(psk_owner)
+  if receipt_done "$receipt" || [ -e "$STATE_ROOT/$run/state.env" ]; then
+    if [ "$owner" != "$run" ]; then
+      receipt_done "$receipt" && die "RUN $run 은 이미 정리됨 — 현재 secrets를 변경하지 않음(소유 RUN 확인)"
+      die "이 RUN은 apply 기록(state.env)이 있음 — 'rollback $run'을 사용"
+    fi
+    if [ -e "$SECRETS" ]; then
+      receipt_done "$receipt" && die "RUN $run 은 정리 기록이 있는데 secrets가 있음 — 변경하지 않음(수동 확인)"
+      die "이 RUN은 apply 기록(state.env)이 있음 — 'rollback $run'을 사용"
+    fi
+    release_only=1
+  fi
+  [ "$owner" = "$run" ] || die "현재 secrets 소유 RUN은 '${owner:-없음}' — RUN $run 으로 지우지 않음"
+  for f in "$CONF" "$NFT_FILE" "$UNIT_FILE"; do
+    [ -e "$f" ] && die "설치 파일이 있음($f) — psk-clean 대상 아님, 소유 RUN rollback 확인"
+  done
+  nft_table_state
+  case $? in
+    0) die "fds_p2_vpn table 있음 — psk-clean 대상 아님, 소유 RUN rollback 확인" ;;
+    1) : ;;
+    *) die "nft 목록 조회 실패 — 부재로 취급하지 않고 중단(secrets 보존)" ;;
+  esac
+  unit_state || die "포워딩 유닛 상태 조회 실패 — 중단(secrets 보존)"
+  unit_stopped || die "포워딩 유닛이 남아 있음($UNIT_ACT/$UNIT_EN) — psk-clean 대상 아님"
+  # ipsec 상태: 정상 응답(active/inactive/failed)만 진행한다. 조회 오류·빈값·전환 중이면 지우지 않는다(PR6 리뷰 C2).
+  local svc_rc conn_rc
+  ipsec_svc_state; svc_rc=$?
+  case "$svc_rc" in
+    0)
+      conn_loaded; conn_rc=$?
+      case "$conn_rc" in
+        1) : ;;
+        0) die "conn $CONN 이 적재돼 있음 — psk-clean 대상 아님, 소유 RUN rollback 확인" ;;
+        *) die "conn 조회 실패 — 중단(secrets 보존)" ;;
+      esac ;;
+    1) : ;;
+    *) die "ipsec 상태 확인 불가($IPSEC_SVC) — 중단(secrets 보존)" ;;
+  esac
+  if [ -e "$SECRETS" ]; then
+    shred -u "$SECRETS" 2>/dev/null || rm -f "$SECRETS" || die "secrets 삭제 실패 — 소유 $run 유지"
+  fi
+  [ -e "$SECRETS" ] && die "secrets가 남아 있음 — 소유 $run 유지"
+  echo "secrets: absent"
+  # ipsec이 떠 있으면 pluto가 읽어 둔 키도 다시 읽혀 비운다. 실패하면 소유를 유지해 같은 RUN으로 재시도한다.
+  if [ "$svc_rc" = 0 ]; then
+    ipsec_cmd rereadsecrets || die "secrets 파일은 삭제됨, rereadsecrets 실패 — 소유 $run 유지, 같은 RUN으로 재시도"
+    echo "rereadsecrets rc=0"
+  fi
+  release_owner "$run" psk-clean || die "정리 기록·소유 해제 실패(secrets는 삭제됨) — 원인 해소 뒤 'psk-clean $run' 재시도"
+  [ "$release_only" = 1 ] && echo "소유 기록 정리만 재시도함(secrets·설치 흔적 부재 확인)"
+  echo "PSK_CLEAN_DONE role=$ROLE run=$run"
 }
 
 # 런타임 포워딩을 끄고 readback으로 0을 확인한다.
@@ -211,6 +333,15 @@ unit_stopped() {
   return 0
 }
 
+# 표 목록 조회가 성공한 뒤에만 있음·없음을 판정한다(PR #11 6163219831 R1).
+# 0=있음, 1=조회 성공·없음, 2=조회 오류(없음으로 보지 않는다)
+nft_table_state() {
+  local tables
+  tables=$(nft list tables) || return 2
+  if grep -qx 'table inet fds_p2_vpn' <<< "$tables"; then return 0; fi
+  return 1
+}
+
 do_apply() {
   need_root; identity_check
   local run=${1:-}; [[ "$run" =~ ^[0-9]{8}T[0-9]{4}$ ]] || die "RUN 형식 YYYYMMDDTHHMM 필요"
@@ -221,10 +352,17 @@ do_apply() {
   for f in "$CONF" "$NFT_FILE" "$UNIT_FILE"; do
     [ -e "$f" ] && die "기존 설치 존재 — 소유 RUN 원복·확인 후 재시도: $f"
   done
-  nft list table inet fds_p2_vpn > /dev/null 2>&1 && die "기존 fds_p2_vpn table 존재 — 소유 RUN 확인 필요"
+  nft_table_state
+  case $? in
+    0) die "기존 fds_p2_vpn table 존재 — 소유 RUN 확인 필요" ;;
+    1) : ;;
+    *) die "nft 목록 조회 실패 — 부재로 취급하지 않고 설치 중단" ;;
+  esac
   # 파일이 없어도 이전 RUN의 유닛이 살아 있거나 부팅 링크가 남아 있으면 덮어쓰지 않는다.
   unit_state || die "포워딩 유닛 상태 조회 실패('$UNIT_ACT'/'$UNIT_EN') — 설치 중단"
   unit_stopped || die "포워딩 유닛이 남아 있음($UNIT_ACT/$UNIT_EN) — 소유 RUN 원복·확인 후 재시도"
+  # secrets는 이 RUN이 psk로 만든 것이어야 한다(PR6 리뷰 C1: 실행·정리의 RUN 결속).
+  [ "$(psk_owner)" = "$run" ] || die "secrets 소유 RUN('$(psk_owner)')이 apply RUN($run)과 다름 — 'psk $run'으로 만든 secrets만 사용"
   mkdir -p "$dir/backup" "$dir/staged" || die "state 디렉터리 생성 실패"
   chmod 700 "$STATE_ROOT" "$dir" || die "state 디렉터리 권한 설정 실패"
   render "$dir/staged" || die "render 실패"
@@ -355,6 +493,17 @@ do_rollback() {
   if [ -e "$ACTIVE" ] && [ "$(cat "$ACTIVE")" != "$run" ]; then
     die "활성 RUN은 $(cat "$ACTIVE") — 다른 RUN($run)으로 원복하지 않음"
   fi
+  # 첫 호스트 변경 전에 소유를 확인한다(PR6 재검토 5515275797 C1 잔여). 끝난 옛 RUN이 다음 RUN의 secrets를
+  # 지우거나 옛 백업으로 현재 호스트를 되돌리지 않게, 정리 완료 기록이 없고 OWNER와 RUN이 같을 때만 진행한다.
+  local owner="" receipt=$PSK_RECEIPTS/$run
+  receipt_done "$receipt" &&
+    die "RUN $run 은 이미 정리됨 — 현재 호스트를 변경하지 않음(소유 기록만 남았으면 'psk-clean $run')"
+  if [ -e "$PSK_OWNER" ]; then owner=$(cat "$PSK_OWNER") || die "secrets 소유 RUN 조회 실패 — 현재 호스트를 변경하지 않음"; fi
+  [ "$owner" = "$run" ] || die "secrets 소유 RUN('${owner:-없음}')이 원복 RUN($run)과 다름 — 현재 호스트를 변경하지 않음"
+  # ACTIVE가 없고 secrets도 없으면 이 RUN의 호스트 원복은 이미 끝났고 소유 해제만 남은 상태다.
+  if [ ! -e "$ACTIVE" ] && [ ! -e "$SECRETS" ]; then
+    die "RUN $run 의 호스트 원복은 끝났고 소유 기록 정리만 남음 — 'psk-clean $run'으로 마무리(호스트 변경 없음)"
+  fi
   # shellcheck disable=SC1091
   . "$dir/state.env"
   local failed=() b
@@ -363,6 +512,11 @@ do_rollback() {
   # 1) 통제를 걷기 전에 포워딩부터 끈다. 0이 확인되지 않으면 허용표·유닛을 건드리지 않고 멈춘다.
   forward_off || die "ip_forward=0 설정/확인 실패 — 허용표를 그대로 두고 중단(재시도 가능)"
   echo "== ip_forward=0 확인"
+  nft_table_state
+  case $? in
+    0|1) : ;;
+    *) die "nft 목록 조회 실패 — ip_forward=0·통제·ACTIVE 보존, 같은 RUN으로 재시도" ;;
+  esac
 
   # 2) conn: 등록·없음·조회 실패를 구분한다. 삭제·부재 확인·조회가 실패하면 ip_forward=0과
   #    허용표·유닛을 그대로 둔 채 멈춘다(원인 해소 뒤 같은 RUN으로 다시 rollback).
@@ -397,14 +551,21 @@ do_rollback() {
     unit_stopped || die "유닛이 아직 $UNIT_ACT/$UNIT_EN — ip_forward=0, 유닛·허용표 파일·ACTIVE 보존, 같은 RUN으로 재시도"
   fi
   echo "유닛: $UNIT_ACT/$UNIT_EN 확인"
+  # 허용표: 조회 오류·삭제 실패·부재 확인 실패면 유닛·허용표 파일과 ACTIVE를 보존하고 멈춘다(같은 RUN 재시도).
+  nft_table_state
+  case $? in
+    0) nft delete table inet fds_p2_vpn ||
+         die "허용표 삭제 실패 — ip_forward=0·통제 파일·ACTIVE 보존, 같은 RUN으로 재시도" ;;
+    1) : ;;
+    *) die "nft 목록 조회 실패 — ip_forward=0·통제 파일·ACTIVE 보존, 같은 RUN으로 재시도" ;;
+  esac
+  nft_table_state
+  [ $? = 1 ] || die "허용표 부재 확인 실패 — ip_forward=0·통제 파일·ACTIVE 보존, 같은 RUN으로 재시도"
+  echo "허용표: 부재 확인"
   if [ -e "$UNIT_FILE" ]; then rm -f "$UNIT_FILE" || fail "$UNIT_FILE 삭제 실패"; fi
   if [ -e "$NFT_FILE" ]; then rm -f "$NFT_FILE" || fail "$NFT_FILE 삭제 실패"; fi
   [ -d "$NFT_DIR" ] && { rmdir "$NFT_DIR" 2>/dev/null || true; }
   systemctl daemon-reload || fail "daemon-reload 실패"
-  if nft list table inet fds_p2_vpn > /dev/null 2>&1; then
-    nft delete table inet fds_p2_vpn || fail "허용표 삭제 실패"
-    nft list table inet fds_p2_vpn > /dev/null 2>&1 && fail "허용표가 남아 있음"
-  fi
 
   # 4) sysctl 파일·런타임 값 복원(readback)
   if [ "$ROLE" = vpn-gw01 ]; then
@@ -458,6 +619,13 @@ do_rollback() {
   if [ "${ipsec_enabled:-enabled}" != enabled ] && [ "$(systemctl is-enabled ipsec 2>/dev/null)" = enabled ]; then
     systemctl disable ipsec > /dev/null 2>&1 || fail "ipsec.service disable 실패"
   fi
+  # apply 전부터 ipsec이 떠 있던 호스트는 계속 떠 있으므로, 지운 secrets를 pluto에서도 비운다(PR6 리뷰 C2).
+  ipsec_svc_state
+  case $? in
+    0) if ipsec_cmd rereadsecrets; then echo "rereadsecrets rc=0"; else fail "rereadsecrets 실패 — pluto에 PSK가 남아 있을 수 있음"; fi ;;
+    1) : ;;
+    *) fail "ipsec 상태 확인 불가($IPSEC_SVC) — pluto 키 정리 미확인" ;;
+  esac
 
   # 7) 정리가 모두 성공했을 때만 apply 전 런타임 ip_forward 복원(readback). 실패가 있으면 0 유지.
   if [ "${#failed[@]}" -eq 0 ]; then
@@ -474,6 +642,14 @@ do_rollback() {
     exit 1
   fi
   rm -f "$ACTIVE" || die "활성 RUN 표식 삭제 실패"
+  # 이 RUN이 소유한 secrets를 지웠으므로 소유를 해제한다. 실패하면 호스트 원복 완료와 소유 기록 정리 미완료를
+  # 구분해 nonzero(3)로 끝낸다. OWNER가 남아 새 RUN psk가 멈추며, 같은 RUN의 psk-clean이 부재 확인 뒤 해제를 마친다.
+  if ! release_owner "$run" rollback; then
+    echo "ROLLBACK_DONE role=$ROLE run=$run owner_release=INCOMPLETE"
+    echo "OWNER_RELEASE_INCOMPLETE run=$run — 호스트 원복은 완료, 소유 기록 정리 미완료: 원인 해소 뒤 'psk-clean $run'" >&2
+    do_check
+    exit 3
+  fi
   echo "ROLLBACK_DONE role=$ROLE run=$run"
   do_check
 }
@@ -481,11 +657,12 @@ do_rollback() {
 case "$CMD" in
   check) do_check ;;
   render) render "${3:?outdir}" ;;
-  psk) do_psk ;;
+  psk) do_psk "${3:-}" ;;
+  psk-clean) do_psk_clean "${3:-}" ;;
   apply) do_apply "${3:-}" ;;
   up) [ "$ROLE" = vpn-gw01 ] || die "up은 개시자(vpn-gw01)만"; need_root; ipsec_cmd up "$CONN" ;;
   status) do_status ;;
   probe) do_probe "${3:-}" "${4:-}" "${5:-5}" ;;
   rollback) do_rollback "${3:-}" ;;
-  *) die "명령: check|render|psk|apply|up|status|probe|rollback" ;;
+  *) die "명령: check|render|psk|psk-clean|apply|up|status|probe|rollback" ;;
 esac

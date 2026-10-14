@@ -58,6 +58,7 @@ case "$name" in
     case "$*" in
       "-c -f "*) [ "${FAKE_NFT_CHECK_FAIL:-}" = 1 ] && exit 1; grep -q 'table inet fds_p2_vpn {' "$3" ;;
       "-f "*) [ -f "$2" ] || exit 1; put nft_table present ;;
+      "list tables") echo "table inet firewalld"; if [ "$(get nft_table absent)" = present ]; then echo "table inet fds_p2_vpn"; fi ;;
       "list table inet fds_p2_vpn") [ "$(get nft_table absent)" = present ] && echo "table inet fds_p2_vpn { counter packets 3 }" || exit 1 ;;
       "delete table inet fds_p2_vpn") [ "$(get nft_table absent)" = present ] || exit 1; put nft_table absent ;;
       *) exit 0 ;;
@@ -78,8 +79,9 @@ case "$name" in
       "enable --now ipsec") put ipsec active; put ipsec_enabled enabled ;;
       "stop ipsec") put ipsec inactive ;;
       "disable ipsec") put ipsec_enabled disabled ;;
-      "is-active --quiet ipsec") [ "$(get ipsec inactive)" = active ] ;;
-      "is-active ipsec") get ipsec inactive; [ "$(get ipsec inactive)" = active ] ;;
+      # 실제 systemctl처럼 active가 아니면 rc3
+      "is-active --quiet ipsec") [ "$(get ipsec inactive)" = active ] || exit 3 ;;
+      "is-active ipsec") get ipsec inactive; [ "$(get ipsec inactive)" = active ] || exit 3 ;;
       "is-enabled ipsec") get ipsec_enabled disabled; [ "$(get ipsec_enabled disabled)" = enabled ] ;;
       *) exit 0 ;;
     esac ;;

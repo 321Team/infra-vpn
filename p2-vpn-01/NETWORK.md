@@ -113,7 +113,7 @@ SA가 없을 때는 Relay의 `rt ipsec missing` drop과 fail-closed 포워딩 �
 | 3 | 공인 IP 변동(교육장 두 주소) | IKE ID는 신원 확인일 뿐이며 SA endpoint·NAT 이동 처리와는 다릅니다. README T11처럼 **SA 유지 또는 DPD 뒤 재수립을 관측**하고 변동 시각·주소를 기록합니다 |
 | 4 | 자동 재수립 안 됨 | vpn-gw01 `sudo bash p2vpn.sh vpn-gw01 up` 1회 |
 | 5 | 4번 실패 | 기존 #37 승인 작업창 안에서 양쪽 `sudo systemctl restart ipsec`(T7 절차) → vpn-gw01이 다시 세우는지 확인 |
-| 6 | 인증 실패(PSK 불일치·교체) | 기존 #37 승인 작업창 안에서만 합니다. rekey로는 풀리지 않습니다. 양쪽 `p2vpn.sh <role> psk`로 같은 PSK를 비표시 입력 → `rereadsecrets` → `up`. PSK 원문은 Git·Issue·PR·채팅에 쓰지 않습니다 |
+| 6 | 인증 실패(PSK 불일치·교체) | 기존 #37 승인 작업창 안에서만 합니다. rekey로는 풀리지 않습니다. 양쪽 `p2vpn.sh <role> psk <활성 RUN>`으로 같은 PSK를 비표시 입력 → `rereadsecrets` → `up`. PSK 원문은 Git·Issue·PR·채팅에 쓰지 않습니다 |
 | 7 | 제안 불일치(`NO_PROPOSAL_CHOSEN` 등) | 양쪽 템플릿의 `ike`·`esp`가 같은지 `check`로 확인합니다. 템플릿 수정은 PR 리뷰 뒤에만 합니다 |
 | 8 | 5~7로 복구되지 않음 | 서비스 영향을 판단합니다. R2가 ON이면 #35에 OFF를 요청하고, db01 사전 창 중이면 `pre-rollback`을 합니다. 터널은 `rollback <RUN>`으로 정리하고 원인을 기록합니다 |
 
