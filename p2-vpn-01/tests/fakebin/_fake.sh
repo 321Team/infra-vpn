@@ -79,8 +79,9 @@ case "$name" in
       "enable --now ipsec") put ipsec active; put ipsec_enabled enabled ;;
       "stop ipsec") put ipsec inactive ;;
       "disable ipsec") put ipsec_enabled disabled ;;
-      "is-active --quiet ipsec") [ "$(get ipsec inactive)" = active ] ;;
-      "is-active ipsec") get ipsec inactive; [ "$(get ipsec inactive)" = active ] ;;
+      # 실제 systemctl처럼 active가 아니면 rc3
+      "is-active --quiet ipsec") [ "$(get ipsec inactive)" = active ] || exit 3 ;;
+      "is-active ipsec") get ipsec inactive; [ "$(get ipsec inactive)" = active ] || exit 3 ;;
       "is-enabled ipsec") get ipsec_enabled disabled; [ "$(get ipsec_enabled disabled)" = enabled ] ;;
       *) exit 0 ;;
     esac ;;
