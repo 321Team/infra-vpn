@@ -96,6 +96,11 @@ class StaticContractTests(unittest.TestCase):
         self.assertLess(post.index("ip_forward=0"), post.index("nft delete table"))
         self.assertIn('test "$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = 0 || exit 1', post,
                       "systemd 변수 확장을 피하려고 $$ 사용, 0 확인 실패 시 허용표를 지우지 않음")
+        # 6163219831 R1: 표 목록 조회 오류를 부재로 보지 않고, 삭제·부재 확인 실패도 nonzero
+        self.assertNotIn("2>&1; then", post, "조회 오류를 숨기는 'list table … 2>&1' 분기 금지")
+        self.assertEqual(post.count("tables=$$(/usr/sbin/nft list tables) || exit 1"), 2)
+        self.assertIn("nft delete table inet fds_p2_vpn || exit 1", post)
+        self.assertNotIn('"%s', post, "systemd 지정자 %s 확장을 피하려고 %%s 사용")
         script = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("net.ipv4.ip_forward = 0", script, "영구 sysctl은 0, 유닛만 켠다")
 
@@ -143,6 +148,7 @@ class RenderTests(unittest.TestCase):
 
 FAKE_TOOLS = ("id", "chown", "cp", "ip", "sysctl", "firewall-cmd", "nft", "systemctl", "ipsec")
 PSK = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6"  # 시험용 값(64자)
+PSK_RUN = "20261012T0900"
 
 
 @unittest.skipUnless(shutil.which("bash") and os.name != "nt", "Linux bash 필요 — CI에서 실행")
@@ -161,8 +167,10 @@ class FakeHostTests(unittest.TestCase):
             (self.bin / name).write_text(src, encoding="utf-8")
             os.chmod(self.bin / name, 0o755)
 
-    def host(self, role, ip_forward, fw_forward="no", ports=()):
+    def host(self, role, ip_forward, fw_forward="no", ports=(), ipsec_active=False):
         (self.state / "ip_forward").write_text(f"{ip_forward}\n")
+        if ipsec_active:
+            (self.state / "ipsec").write_text("active\n")
         (self.state / "fw_forward").write_text(f"{fw_forward}\n")
         (self.state / "fw_ports").write_text("".join(f"{p}\n" for p in ports))
         if role == "relay":
@@ -187,8 +195,8 @@ class FakeHostTests(unittest.TestCase):
     def calls(self):
         return (self.state / "calls.log").read_text().splitlines() if (self.state / "calls.log").exists() else []
 
-    def psk(self, role):
-        done = self.run_cmd(role, "psk", stdin=f"{PSK}\n{PSK}\n")
+    def psk(self, role, run=PSK_RUN):
+        done = self.run_cmd(role, "psk", run, stdin=f"{PSK}\n{PSK}\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         return done
 
@@ -201,7 +209,7 @@ class FakeHostTests(unittest.TestCase):
         self.assertNotIn(PSK, done.stdout + done.stderr, "PSK가 출력에 나오면 안 된다")
         self.assertNotIn(PSK, "\n".join(self.calls()), "PSK가 명령 인자로 넘어가면 안 된다")
         self.assertIn("secrets: present", done.stdout)
-        crlf = self.run_cmd("relay", "psk", stdin=f"{PSK}\r\n{PSK}\r\n")
+        crlf = self.run_cmd("relay", "psk", PSK_RUN, stdin=f"{PSK}\r\n{PSK}\r\n")
         self.assertEqual(crlf.returncode, 0, crlf.stderr)
         self.assertEqual(secrets.read_bytes(), f'@fds-vpn-gw01 @fds-aws-relay01 : PSK "{PSK}"\n'.encode(),
                          "붙여넣기의 줄 끝 CR은 지운다")
@@ -209,7 +217,7 @@ class FakeHostTests(unittest.TestCase):
         for bad, msg in ((f"{PSK}\n{PSK}x\n", "두 입력이 다름"), ("short\nshort\n", "32자 이상"),
                          ('a"' + "b" * 40 + '\n' + 'a"' + "b" * 40 + "\n", "따옴표"),
                          ("a\x1b" + "b" * 40 + "\n" + "a\x1b" + "b" * 40 + "\n", "제어 문자")):
-            failed = self.run_cmd("relay", "psk", stdin=bad)
+            failed = self.run_cmd("relay", "psk", PSK_RUN, stdin=bad)
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn(msg, failed.stderr)
         self.assertEqual(secrets.read_text(), f'@fds-vpn-gw01 @fds-aws-relay01 : PSK "{PSK}"\n', "실패 시 기존 유지")
@@ -307,7 +315,7 @@ class FakeHostTests(unittest.TestCase):
     def test_identity_guard_and_status_redaction(self):
         self.host("relay", 0)
         self.ip = "10.1.93.51"
-        wrong = self.run_cmd("relay", "psk", stdin=f"{PSK}\n{PSK}\n")
+        wrong = self.run_cmd("relay", "psk", PSK_RUN, stdin=f"{PSK}\n{PSK}\n")
         self.assertNotEqual(wrong.returncode, 0)
         self.assertIn("Relay가 아님", wrong.stderr)
         self.ip = "10.20.110.10"
@@ -565,6 +573,143 @@ class FakeHostTests(unittest.TestCase):
         self.assertIn("firewalld 원래 상태 조회 실패", done.stderr)
         self.assertEqual((self.st("fw_ports"), self.st("fw_forward"), self.active()), ("", "no", ""))
         self.assertFalse((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists())
+
+    # ---- 단계 B 리뷰 6163219831 R1: nft 조회 오류를 부재로 보지 않는다 ----
+    def stoppost(self, **env):
+        unit = (PKG / "systemd/fds-p2-vpn-forward.service").read_text(encoding="utf-8")
+        line = next(x for x in unit.splitlines() if x.startswith("ExecStopPost="))
+        body = line[len("ExecStopPost=/bin/sh -c '"):-1]
+        # systemd가 넘기는 형태로 되돌린다($$→$, %%→%) 그리고 절대경로를 가짜 명령으로 바꾼다.
+        body = body.replace("$$", "$").replace("%%", "%")
+        body = body.replace("/usr/sbin/", f"{self.bin.as_posix()}/").replace("/usr/bin/grep", "grep")
+        full = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}", FAKE_STATE=str(self.state), **env)
+        return subprocess.run(["sh", "-c", body], capture_output=True, text=True, env=full)
+
+    def test_r1_stoppost_query_or_delete_error_is_not_success(self):
+        self.host("relay", 1)
+        (self.state / "nft_table").write_text("present\n")
+        for env in ({"FAKE_FAIL": "nft list tables", "FAKE_FAIL_RC": "2"},
+                    {"FAKE_FAIL": "nft delete table inet fds_p2_vpn"}):
+            (self.state / "ip_forward").write_text("1\n")
+            done = self.stoppost(**env)
+            self.assertNotEqual(done.returncode, 0, env)
+            self.assertEqual((self.st("ip_forward"), self.st("nft_table")), ("0", "present"), env)
+        done = self.stoppost()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.st("ip_forward"), self.st("nft_table")), ("0", "absent"))
+        again = self.stoppost()
+        self.assertEqual(again.returncode, 0, "표가 이미 없으면(조회 성공) 정상 종료")
+
+    def test_r1_apply_refuses_when_nft_inventory_query_fails(self):
+        self.host("vpn-gw01", 1, fw_forward="yes")
+        self.psk("vpn-gw01")
+        done = self.run_cmd("vpn-gw01", "apply", "20261014T1700", FAKE_FAIL="nft list tables", FAKE_FAIL_RC="2")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("nft 목록 조회 실패", done.stderr)
+        self.assertEqual((self.active(), self.st("ip_forward")), ("", "1"), "호스트를 바꾸기 전에 중단")
+        self.assertFalse((self.prefix / "etc/ipsec.d/fds-p2-vpn.conf").exists())
+        self.assertEqual(self.gw_file().read_text(), self.GW_ORIG)
+
+    def test_r1_rollback_nft_errors_keep_controls_and_same_run_retry(self):
+        for i, (pattern, rc) in enumerate((("nft list tables", "2"), ("nft delete table inet fds_p2_vpn", "1"))):
+            self.setUp()
+            self.host("vpn-gw01", 1, fw_forward="yes")
+            self.psk("vpn-gw01")
+            run = f"20261014T171{i}"
+            self.assertEqual(self.run_cmd("vpn-gw01", "apply", run).returncode, 0)
+            # 유닛은 멈췄지만 허용표가 남은 상태(리뷰의 재현 조건)
+            (self.state / "unit_active").write_text("inactive\n")
+            (self.state / "unit_enabled").write_text("disabled\n")
+            self.assertEqual(self.st("nft_table"), "present")
+            bad = self.run_cmd("vpn-gw01", "rollback", run, FAKE_FAIL=pattern, FAKE_FAIL_RC=rc)
+            ctx = (pattern, bad.stdout, bad.stderr)
+            self.assertNotEqual(bad.returncode, 0, ctx)
+            self.assertNotIn("ROLLBACK_DONE", bad.stdout, ctx)
+            self.assertEqual((self.st("ip_forward"), self.st("nft_table"), self.active()), ("0", "present", run), ctx)
+            self.assertTrue((self.prefix / "etc/fds-p2-vpn/forward.nft").exists(), "통제 파일 보존")
+            again = self.run_cmd("vpn-gw01", "rollback", run)
+            self.assertEqual(again.returncode, 0, (pattern, again.stderr, again.stdout))
+            self.assertIn("ROLLBACK_DONE", again.stdout)
+            self.assertEqual((self.st("nft_table"), self.active(), self.st("ip_forward")), ("absent", "", "1"))
+            self.assertEqual(self.gw_file().read_text(), self.GW_ORIG)
+
+    # ---- 단계 B 리뷰 6163219831 R2: apply 전에 멈춘 RUN의 secrets 정리 ----
+    def secrets(self):
+        return self.prefix / "etc/ipsec.d/fds-p2-vpn.secrets"
+
+    def receipt(self, run=PSK_RUN):
+        return self.prefix / f"root/fds-p2-vpn/psk-receipts/{run}"
+
+    def test_r2_psk_only_is_cleaned_by_psk_clean_not_rollback(self):
+        self.host("relay", 0)
+        done = self.psk("relay")
+        self.assertIn("psk_receipt=", done.stdout)
+        text = self.receipt().read_text()
+        self.assertIn(f"run={PSK_RUN}", text)
+        self.assertNotIn(PSK, text, "기록에 PSK 없음")
+        back = self.run_cmd("relay", "rollback", PSK_RUN)
+        self.assertNotEqual(back.returncode, 0)
+        self.assertIn("state.env 없음", back.stderr)
+        clean = self.run_cmd("relay", "psk-clean", PSK_RUN)
+        self.assertEqual(clean.returncode, 0, clean.stderr + clean.stdout)
+        self.assertIn("PSK_CLEAN_DONE role=relay", clean.stdout)
+        self.assertFalse(self.secrets().exists())
+        self.assertIn("cleaned_at=", self.receipt().read_text())
+        self.assertEqual((self.st("ip_forward"), self.st("nft_table") or "absent"), ("0", "absent"))
+
+    def test_r2_apply_precheck_stop_then_psk_clean(self):
+        self.host("vpn-gw01", 1, fw_forward="yes", ipsec_active=True)
+        self.psk("vpn-gw01", "20261014T1720")
+        done = self.run_cmd("vpn-gw01", "apply", "20261014T1720", FAKE_CHECKCONFIG_FAIL="1")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("conn 문법 검사 실패", done.stderr)
+        self.assertTrue(self.secrets().exists(), "사전 검사 중단 뒤 secrets가 남는 경로")
+        self.assertEqual(self.active(), "")
+        back = self.run_cmd("vpn-gw01", "rollback", "20261014T1720")
+        self.assertNotEqual(back.returncode, 0)
+        clean = self.run_cmd("vpn-gw01", "psk-clean", "20261014T1720")
+        self.assertEqual(clean.returncode, 0, clean.stderr + clean.stdout)
+        self.assertFalse(self.secrets().exists())
+        rereads = [c for c in self.calls() if "rereadsecrets" in c]
+        self.assertEqual(len(rereads), 2, "psk 때 1회 + 삭제 뒤 pluto에서 비우는 1회")
+        self.assertEqual((self.st("ip_forward"), self.gw_file().read_text()), ("1", self.GW_ORIG), "호스트 설정 불변")
+
+    def test_r2_refusals_keep_unowned_or_installed_secrets(self):
+        self.host("relay", 0)
+        foreign = '@x @y : PSK "not-ours"\n'
+        self.secrets().write_text(foreign)
+        over = self.run_cmd("relay", "psk", PSK_RUN, stdin=f"{PSK}\n{PSK}\n")
+        self.assertNotEqual(over.returncode, 0)
+        self.assertIn("생성 기록이 없음", over.stderr)
+        clean = self.run_cmd("relay", "psk-clean", PSK_RUN)
+        self.assertNotEqual(clean.returncode, 0)
+        self.assertIn("생성 기록 없음", clean.stderr)
+        self.assertEqual(self.secrets().read_text(), foreign, "출처 모르는 secrets는 덮어쓰거나 지우지 않음")
+        self.secrets().unlink()
+        self.psk("relay")
+        self.assertEqual(self.run_cmd("relay", "apply", "20261014T1730").returncode, 0)
+        busy = self.run_cmd("relay", "psk-clean", PSK_RUN)
+        self.assertNotEqual(busy.returncode, 0)
+        self.assertIn("rollback", busy.stderr)
+        self.assertTrue(self.secrets().exists())
+        other = self.run_cmd("relay", "psk", "20261014T1731", stdin=f"{PSK}\n{PSK}\n")
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("다른 RUN", other.stderr)
+        rotate = self.run_cmd("relay", "psk", "20261014T1730", stdin=f"{PSK}\n{PSK}\n")
+        self.assertEqual(rotate.returncode, 0, rotate.stderr)
+        back = self.run_cmd("relay", "rollback", "20261014T1730")
+        self.assertEqual(back.returncode, 0, back.stderr + back.stdout)
+        self.assertFalse(self.secrets().exists())
+        self.assertIn("by=rollback", self.receipt("20261014T1730").read_text())
+
+    def test_r2_psk_clean_stops_on_nft_query_error(self):
+        self.host("relay", 0)
+        self.psk("relay")
+        bad = self.run_cmd("relay", "psk-clean", PSK_RUN, FAKE_FAIL="nft list tables", FAKE_FAIL_RC="2")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("nft 목록 조회 실패", bad.stderr)
+        self.assertTrue(self.secrets().exists(), "조회 오류면 secrets 보존")
+        self.assertNotIn("cleaned_at=", self.receipt().read_text())
 
 
 @unittest.skipUnless(os.environ.get("P2VPN_CONTAINER_IT") == "1" and shutil.which("docker"),

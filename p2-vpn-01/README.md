@@ -50,7 +50,7 @@
 | `conf/vpn-gw01.conf.tmpl`, `conf/relay.conf.tmpl` | `/etc/ipsec.d/fds-p2-vpn.conf` |
 | `nft/*.nft.tmpl` | `/etc/fds-p2-vpn/forward.nft` |
 | `systemd/fds-p2-vpn-forward.service` | `/etc/systemd/system/` |
-| `p2vpn.sh` | 실행기(`check`·`render`·`psk`·`apply`·`up`·`status`·`probe`·`rollback`) |
+| `p2vpn.sh` | 실행기(`check`·`render`·`psk`·`psk-clean`·`apply`·`up`·`status`·`probe`·`rollback`) |
 | `tests/test_p2vpn.py` | 정적·렌더 시험, 가짜 호스트 흐름 시험(`tests/fakebin/`), CentOS Stream 9·10 실제 Libreswan·nftables 문법 시험 |
 | `NETWORK.md` | 설치하지 않음. #37 핵심 요구 문서: CIDR 대장·중복 검사, Route 권위(전파 없음, static 경로별 원본), 재협상(rekey)·재수립 절차 |
 | `tests/test_network_contract.py` | `NETWORK.md`의 CIDR 비중복·selector·rekey 계산이 템플릿과 같은지 보는 정적 시험 |
@@ -61,12 +61,14 @@
 
 - **누가:** #37 Lead(이재환)가 만들고, 양쪽에 넣고, 교체합니다.
 - **만들기:** 작업 PC에서 `openssl rand -base64 48`로 만듭니다. 64자, 따옴표·공백 없음. 파일·메모·채팅·Issue·증적에 저장하지 않습니다.
-- **넣기:** 양쪽 세션에서 `sudo bash p2vpn.sh <role> psk`를 실행합니다. `read -s`라 화면·history에 남지 않고, 두 번 입력해 대조합니다. 결과 파일은 `root:root 0600`이고 SELinux 라벨을 복원합니다.
+- **넣기:** 양쪽 세션에서 `sudo bash p2vpn.sh <role> psk <RUN>`을 실행합니다. `read -s`라 화면·history에 남지 않고, 두 번 입력해 대조합니다. 결과 파일은 `root:root 0600`이고 SELinux 라벨을 복원합니다.
+  - 새로 만들 때는 secrets가 없어야 합니다. 출처를 모르는 기존 파일은 덮어쓰지 않습니다. 설치가 살아 있으면(활성 RUN) 그 RUN의 교체만 허용합니다.
+  - 생성 기록 `/root/fds-p2-vpn/psk-receipts/<RUN>`에 RUN·경로·시각만 남깁니다(PSK·해시 없음). apply 전에 멈춘 RUN의 정리(`psk-clean`)가 이 기록으로 소유를 확인합니다.
   - 입력값은 bash 내장 `printf`로만 파일에 씁니다. 프로세스 인자(argv)에 나타나지 않습니다.
   - 보고하는 것은 존재·소유자·권한뿐입니다. 파일 해시도 남기지 않습니다.
 - **세션 기록:** Relay SSM 세션 문서는 로그를 끈 상태입니다(`SSM-SessionManagerRunShell`). PC 쪽 터미널 기록이나 `script --log-in/--log-io`도 쓰지 않습니다.
 - **양쪽 일치 확인:** 별도 해시로 하지 않고, 터널 인증 성공(IKE_AUTH)으로 확인합니다. 불일치면 `AUTHENTICATION_FAILED`가 납니다.
-- **교체·재구축:** 새 PSK를 만들어 양쪽에 `psk`를 다시 실행합니다(`rereadsecrets` 자동). Relay를 다시 만들면 PSK를 다시 넣어야 하므로, 재구축은 무인 복구로 세지 않습니다.
+- **교체·재구축:** 새 PSK를 만들어 양쪽에 활성 RUN으로 `psk <RUN>`을 다시 실행합니다(`rereadsecrets` 자동). Relay를 다시 만들면 PSK를 다시 넣어야 하므로, 재구축은 무인 복구로 세지 않습니다.
 - **Relay 권한:** `AmazonSSMManagedInstanceCore`는 Parameter Store 읽기를 `*`로 허용합니다. 그래서 PSK를 Parameter Store에 두지 않습니다(6014247521 §2).
 
 ## 실행 순서 (실행자 이재환)
@@ -88,11 +90,24 @@
 |---|---|---|---|
 | B0 | 둘 다 | 패키지 전달 → `sha256sum -c` | 리뷰 SHA의 파일 해시와 일치 |
 | B1 | 둘 다 | `sudo bash p2vpn.sh <role> check` | 버전·sysctl·firewalld·기존 파일 기록. 기존 `fds-p2-vpn` 없음 |
-| B2 | 둘 다 | `sudo bash p2vpn.sh <role> psk` | `secrets: present owner=root:root mode=600` |
+| B2 | 둘 다 | `sudo bash p2vpn.sh <role> psk <RUN>` | `secrets: present owner=root:root mode=600`, `psk_receipt=…/<RUN>` |
 | B3 | Relay | `sudo bash p2vpn.sh relay apply <RUN>` | `APPLY_OK`. UDP 500/4500 열림, 허용표 적재, `ip_forward=1`, conn 등록 |
 | B4 | vpn-gw01 | `sudo RELAY_EIP=<EIP> bash p2vpn.sh vpn-gw01 apply <RUN>` | `APPLY_OK` |
 | B5 | vpn-gw01 | `sudo bash p2vpn.sh vpn-gw01 up` | IKE SA와 Child SA 수립 |
 | B6 | 둘 다 | `status`, T1·T2·T4·T5·T10 | 아래 시험표. 결과를 `tunnel_readiness_reference`로 묶음 |
+
+### 단계 B 중단·정리 — 호스트별 실제 단계에 맞춰
+한쪽이 실패하면 **다음 단계를 진행하지 않고**, 양쪽을 각자 도달한 단계에 맞춰 정리한 뒤 `check`로 확인합니다. 한쪽 실패를 이유로 상대편 서비스나 파일을 일괄로 멈추거나 지우지 않습니다.
+
+| 호스트 상태 | 판별 | 정리 |
+|---|---|---|
+| 미착수 | secrets 없음, 생성 기록 없음, 활성 RUN 없음 | 없음 |
+| PSK만 생성(B2 뒤 중단) | `psk-receipts/<RUN>` 있음, `<RUN>/state.env`·활성 RUN 없음 | `sudo bash p2vpn.sh <role> psk-clean <RUN>` → `PSK_CLEAN_DONE`. secrets 부재 확인, ipsec이 떠 있으면 `rereadsecrets`로 pluto에서도 비움 |
+| apply 사전 검사에서 중단 | 위와 같음 + `<RUN>/staged`만 있고 `state.env` 없음(`rollback`은 `state.env 없음`으로 거부) | `psk-clean <RUN>`. 같은 RUN으로 다시 apply할 수 없으므로 재시도는 새 RUN |
+| apply 부분·완료 | `<RUN>/state.env`·활성 RUN 있음 | `rollback <RUN>` → `ROLLBACK_DONE`. 실패하면 `ROLLBACK_INCOMPLETE`, `ip_forward=0`·활성 RUN 보존, 같은 RUN으로 재시도 |
+
+- `psk-clean`은 이 RUN의 생성 기록이 있는 secrets만 지웁니다. 설치 파일·`fds_p2_vpn` 표·포워딩 유닛·conn 적재 중 하나라도 있으면 rollback 대상이므로 멈춥니다. nft 목록 조회가 실패하면 부재로 보지 않고 secrets를 보존한 채 멈춥니다.
+- 예: Relay B3 `APPLY_OK`, vpn-gw01 B4 사전 검사 실패 → Relay는 `rollback <RUN>`, vpn-gw01은 `psk-clean <RUN>`.
 
 ### 단계 C — 승인 경로 준비 (별도 승인)
 1. **#35:** `private_a → Relay ENI` route 활성화(`activate_onprem_routes=true`, `onprem_route_keys=["private_a"]`, 근거 = 단계 B 증적)
@@ -162,6 +177,8 @@ T3 → T6 → T3(복구 후) 순서로 진행하고, 이어서 T7~T9·T11, 마�
 7. apply 전에 꺼져 있던 `ipsec.service`는 다시 끄고 disable
 8. **위 정리가 모두 성공했을 때만** apply 전 런타임 `ip_forward` 값 복원(readback). 그 전까지와 실패 시에는 0 유지
 
+허용표(`fds_p2_vpn`)는 **`nft list tables` 조회가 성공한 뒤에만** 있음·없음을 판정합니다. 조회 오류·삭제 실패·삭제 뒤 부재 확인 실패면 `ip_forward=0`과 유닛·허용표 파일·활성 RUN을 그대로 두고 멈춥니다(같은 RUN 재시도). apply도 조회 오류면 설치 전에 멈추고, 포워딩 유닛의 `ExecStopPost`도 같은 조회 오류·삭제 실패에서 nonzero로 끝납니다.
+
 단계마다 rc·readback을 확인합니다. 하나라도 실패하면 `ROLLBACK_DONE` 없이 `ROLLBACK_INCOMPLETE`와 실패 목록을 남기고 nonzero로 끝나며, `ip_forward=0`과 활성 RUN 표식을 유지합니다. 원인을 해소한 뒤 같은 RUN으로 다시 `rollback`할 수 있습니다. 모두 성공하면 표식을 지우고 `check`를 다시 출력합니다.
 
 ## 증적
@@ -191,6 +208,8 @@ P2VPN_CONTAINER_IT=1 python3 -m unittest discover -s p2-vpn-01/tests -v
     - firewalld는 바뀐 것이 있을 때만 reload
     - vpn-gw01 영구 sysctl은 0으로 바뀌고 원복하면 원래 값으로 돌아감
     - Libreswan 4.x는 `ipsec auto` 명령을 씀
+    - nft 목록 조회 오류(rc2 주입)·허용표 삭제 실패에서 apply는 설치 전 중단, rollback·`ExecStopPost`는 nonzero·허용표 보존, 같은 RUN 재시도로 정리
+    - `psk <RUN>` 생성 기록, 출처 모르는 secrets 덮어쓰기 거부, B2 뒤·apply 사전 검사 뒤 `psk-clean`으로 정리, 활성 RUN이 있으면 `psk-clean` 거부
     - 역할과 호스트 주소가 다르면 중단
     - `status`에서 xfrm 키를 가림
 - 두 번째 명령에는 docker가 필요합니다. CentOS Stream 9·10 고정 digest에 배포판 `libreswan`·`nftables`를 설치하고 실제 문법을 검사합니다. 서버나 클러스터에는 접속하지 않습니다.

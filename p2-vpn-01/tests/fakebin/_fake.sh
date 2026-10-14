@@ -58,6 +58,7 @@ case "$name" in
     case "$*" in
       "-c -f "*) [ "${FAKE_NFT_CHECK_FAIL:-}" = 1 ] && exit 1; grep -q 'table inet fds_p2_vpn {' "$3" ;;
       "-f "*) [ -f "$2" ] || exit 1; put nft_table present ;;
+      "list tables") echo "table inet firewalld"; if [ "$(get nft_table absent)" = present ]; then echo "table inet fds_p2_vpn"; fi ;;
       "list table inet fds_p2_vpn") [ "$(get nft_table absent)" = present ] && echo "table inet fds_p2_vpn { counter packets 3 }" || exit 1 ;;
       "delete table inet fds_p2_vpn") [ "$(get nft_table absent)" = present ] || exit 1; put nft_table absent ;;
       *) exit 0 ;;
