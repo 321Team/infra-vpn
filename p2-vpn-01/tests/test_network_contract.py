@@ -17,9 +17,10 @@ CONF = {role: (PKG / "conf" / f"{role}.conf.tmpl").read_text(encoding="utf-8") f
 ONPREM = "10.1.93.0/24"
 VPC = "10.20.0.0/16"
 # §1.1 최상위 확정 대역(출처는 NETWORK.md 표)
-FIXED = [ONPREM, "10.250.10.0/24", "192.168.10.0/24", "10.244.0.0/16", "10.96.0.0/12", VPC]
+# ROSA Pod·Service는 §1.2 설계 Freeze 채택값(2026-10-19)
+ROSA_POD, ROSA_SERVICE, ROSA_HOST_PREFIX = "10.128.0.0/14", "172.30.0.0/16", "/23"
+FIXED = [ONPREM, "10.250.10.0/24", "192.168.10.0/24", "10.244.0.0/16", "10.96.0.0/12", VPC, ROSA_POD, ROSA_SERVICE]
 SUBNETS = ["10.20.10.0/24", "10.20.20.0/24", "10.20.30.0/24", "10.20.110.0/24"]
-ROSA_DEFAULT_CANDIDATES = ["10.128.0.0/14", "172.30.0.0/16"]  # §1.2: 문서 기본값 후보, 확정 아님
 
 
 def net(c):
@@ -67,11 +68,13 @@ class CidrLedgerTests(unittest.TestCase):
         for a, b in itertools.combinations(SUBNETS, 2):
             self.assertFalse(net(a).overlaps(net(b)), f"{a} overlaps {b}")
 
-    def test_rosa_default_candidates_avoid_fixed_blocks(self):
-        for c in ROSA_DEFAULT_CANDIDATES:
-            for f in FIXED:
-                self.assertFalse(net(c).overlaps(net(f)), f"{c} overlaps {f}")
-            self.assertIn(f"`{c}`", DOC)
+    def test_rosa_adopted_blocks_stay_out_of_tunnel_selectors(self):
+        for c in (ROSA_POD, ROSA_SERVICE):
+            for sel in (ONPREM, VPC):
+                self.assertFalse(net(c).overlaps(net(sel)), f"{c} overlaps selector {sel}")
+        self.assertIn(f"host prefix `{ROSA_HOST_PREFIX}`", DOC)
+        # 이 Pod CIDR에서 /23 노드 블록이 실제로 나뉘는지(prefix 길이 관계)
+        self.assertLess(net(ROSA_POD).prefixlen, int(ROSA_HOST_PREFIX.lstrip("/")))
 
     def test_doc_lists_every_block(self):
         for c in FIXED + SUBNETS:
