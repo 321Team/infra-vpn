@@ -36,7 +36,7 @@
 
 터널 바깥 주소(IKE·ESP를 싣는 공인 주소)는 selector가 아니므로 위 표와 겹침 판정에서 뺍니다.
 - 교육장 공인 IP: `121.160.42.93` ↔ `180.80.107.14`(교환 중에도 바뀜, README 설계 요약)
-- Relay EIP: 미생성
+- Relay EIP: 미생성(2026-10-12 작성 시점 스냅샷. 현재 자원 상태의 근거로 쓰지 않음)
 
 ### 1.2 ROSA Pod / Service CIDR, host prefix — 설계 Freeze 채택값
 
@@ -45,7 +45,7 @@
   - 생성 코드: infra-terraform `terraform/rosa-runtime/main.tf`(PR34 `f60a803`)
   - 설계 Freeze 확정: [#34 6259117130](https://github.com/321Team/fds-project-baseline/issues/34#issuecomment-6259117130)(2026-10-19 12:38 KST)
   - 이 값으로 클러스터 `fds-rosa-hcp`가 생성됐습니다([infra-rosa#4 6248849533](https://github.com/321Team/infra-rosa/issues/4#issuecomment-6248849533)).
-- **실측:** 생성된 클러스터의 network 값(`rosa describe cluster`·`network.config`)을 공개 기록으로 대조한 것은 아직 없습니다(**NOT VERIFIED**). #38 Basic Ready 인계에 실측값이 오면 이 절에 연결합니다. 다르면 drift로 기록하고 §1.1 표와 시험을 다시 고칩니다.
+- **실측:** 생성된 클러스터의 network 값(`rosa describe cluster`·`network.config`)을 공개 기록으로 대조한 것은 아직 없습니다(**NOT VERIFIED**). #38 Basic Ready의 기존 원본·인계에 실측값이 있으면 이 절에 연결합니다. 불일치하면 채택값과 관측값을 분리해 drift로 기록하고 원인·처리 방향을 확인합니다. 채택 사양 자체를 변경해야 할 때만 #34의 기존 변경통제를 거쳐 §1.1 표와 시험의 기대값을 갱신합니다.
 
 이 대역은 다음 조건을 지킵니다.
 
@@ -57,7 +57,7 @@
 
 **Route 전파는 없습니다.** D21 transport는 AWS EC2 Relay(Libreswan) 1대이고, VGW·TGW·BGP는 채택하지 않았습니다([#34 권위표](https://github.com/321Team/fds-project-baseline/issues/34), infra-terraform `docs/preflight-20261007/freeze-execution-gates-20261010.md`). 그래서 이 구간의 모든 경로는 static이고, 경로마다 권위 원본이 하나씩 있습니다.
 
-| # | 경로 | 위치 | 권위 원본 | 변경 주체·승인 | 현재(2026-10-12) |
+| # | 경로 | 위치 | 권위 원본 | 변경 주체·승인 | 2026-10-12 작성 시점(과거 스냅샷, 현재 상태 근거 아님) |
 |---|---|---|---|---|---|
 | R1 | public `0.0.0.0/0 → IGW`, private `0.0.0.0/0 → NAT` | VPC route table 4개 | infra-terraform `terraform/network`(source `81162467`) | #35 IaC 실행 Lead 이하영, network Apply GO | 생산자 보고: Apply 완료·readback 20/20 PASS(2026-10-12 10:47 KST, [#11 6116326502](https://github.com/321Team/infra-terraform/issues/11#issuecomment-6116326502)). 독립 readback 검토와 Stage-A 완료는 별도 |
 | R2 | `private_a`: `10.1.93.0/24 → Relay ENI` | `private_a` route table | infra-terraform `terraform/vpn` `aws_route.onprem`(`activate_onprem_routes`, `onprem_route_keys=["private_a"]`만 허용) | #35 route 승인. 근거는 README 단계 B 증적 | OFF(`activate_onprem_routes=false`) |
