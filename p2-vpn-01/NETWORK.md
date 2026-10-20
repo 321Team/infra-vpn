@@ -4,7 +4,7 @@
 
 | 핵심 요구 | 이 문서 | 상태 |
 |---|---|---|
-| On-Prem/VPC CIDR 중복을 방지한다 | §1 | 확정값은 중복 없음(정적 시험). ROSA Pod/Service CIDR이 미정이라 **부분** |
+| On-Prem/VPC CIDR 중복을 방지한다 | §1 | 확정값은 중복 없음(정적 시험). ROSA Pod/Service CIDR은 설계 Freeze 채택값으로 포함(§1.2). 실제 클러스터 network 값 readback은 NOT VERIFIED |
 | Route 전파와 Static Route의 권위 Source를 명시한다 | §2 | 명시 |
 | Tunnel 재협상 절차를 기록한다 | §3 | 기록. 실제 rekey 관측(T9)은 NOT RUN |
 | UDP 500/4500과 NAT-T 조건을 검증한다 | §4 | 설계만. 검증은 Runtime T1 |
@@ -29,26 +29,35 @@
 | ├ `private_c` | `10.20.30.0/24` | 같은 곳 | VPC selector 안 |
 | └ `public_transport_a`(Relay `10.20.110.10`) | `10.20.110.0/24` | 같은 곳 | VPC selector 안 |
 | ROSA machine CIDR | `10.20.0.0/16` | infra-rosa#3·#4 확정(= VPC) | VPC selector와 같음 |
+| ROSA Pod | `10.128.0.0/14` (host prefix `/23`) | 설계 Freeze(§1.2) | 아님 |
+| ROSA Service | `172.30.0.0/16` | 설계 Freeze(§1.2) | 아님 |
 
-**중복 검사 결과:** 위 표의 최상위 대역 6개(`10.1.93.0/24`, `10.250.10.0/24`, `192.168.10.0/24`, `10.244.0.0/16`, `10.96.0.0/12`, `10.20.0.0/16`)는 서로 겹치지 않습니다. VPC 서브넷 4개는 VPC 안에 있고 서로 겹치지 않습니다. `tests/test_network_contract.py`가 Python `ipaddress`로 확인합니다.
+**중복 검사 결과:** 위 표의 최상위 대역 8개(`10.1.93.0/24`, `10.250.10.0/24`, `192.168.10.0/24`, `10.244.0.0/16`, `10.96.0.0/12`, `10.20.0.0/16`, `10.128.0.0/14`, `172.30.0.0/16`)는 서로 겹치지 않습니다. VPC 서브넷 4개는 VPC 안에 있고 서로 겹치지 않습니다. `tests/test_network_contract.py`가 Python `ipaddress`로 확인합니다.
 
 터널 바깥 주소(IKE·ESP를 싣는 공인 주소)는 selector가 아니므로 위 표와 겹침 판정에서 뺍니다.
 - 교육장 공인 IP: `121.160.42.93` ↔ `180.80.107.14`(교환 중에도 바뀜, README 설계 요약)
-- Relay EIP: 미생성
+- Relay EIP: 미생성(2026-10-12 작성 시점 스냅샷. 현재 자원 상태의 근거로 쓰지 않음)
 
-### 1.2 미정 대역 — ROSA Pod / Service CIDR, host prefix
+### 1.2 ROSA Pod / Service CIDR, host prefix — 설계 Freeze 채택값
 
-[infra-rosa#4](https://github.com/321Team/infra-rosa/issues/4) 생성 입력에서 "미정(#35 IaC 입력)"입니다. 생성 입력을 정할 때 다음을 지켜야 합니다.
+- **값:** Pod `10.128.0.0/14`, Service `172.30.0.0/16`, host prefix `/23`.
+- **출처:**
+  - 생성 코드: infra-terraform `terraform/rosa-runtime/main.tf`(PR34 `f60a803`)
+  - 설계 Freeze 확정: [#34 6259117130](https://github.com/321Team/fds-project-baseline/issues/34#issuecomment-6259117130)(2026-10-19 12:38 KST)
+  - 이 값으로 클러스터 `fds-rosa-hcp`가 생성됐습니다([infra-rosa#4 6248849533](https://github.com/321Team/infra-rosa/issues/4#issuecomment-6248849533)).
+- **실측:** 생성된 클러스터의 network 값(`rosa describe cluster`·`network.config`)을 공개 기록으로 대조한 것은 아직 없습니다(**NOT VERIFIED**). #38 Basic Ready의 기존 원본·인계에 실측값이 있으면 이 절에 연결합니다. 불일치하면 채택값과 관측값을 분리해 drift로 기록하고 원인·처리 방향을 확인합니다. 채택 사양 자체를 변경해야 할 때만 #34의 기존 변경통제를 거쳐 §1.1 표와 시험의 기대값을 갱신합니다.
 
-1. §1.1의 확정 대역과 겹치지 않습니다. 특히 `10.1.93.0/24`, `10.250.10.0/24`, `10.20.0.0/16`과 겹치면 안 됩니다.
+이 대역은 다음 조건을 지킵니다.
+
+1. §1.1의 다른 확정 대역과 겹치지 않습니다. 특히 `10.1.93.0/24`, `10.250.10.0/24`, `10.20.0.0/16`과 겹치면 안 됩니다(정적 시험에서 확인).
 2. 터널 selector는 `10.1.93.0/24 <-> 10.20.0.0/16`뿐입니다. Pod·Service 주소가 출발지 그대로 On-Prem으로 나가면 터널에 들어가지 않고 막힙니다. 그래서 db01·Harbor가 보는 출발지는 worker 노드 주소(`private_a` `10.20.10.0/24`)여야 합니다. 이 조건은 infra-rosa `platform/netpol/TEST-PLAN.md` C1(Worker 노드 IP가 `10.20.0.0/16` 안)과 #47 A4에서 실제로 확인합니다.
-3. ROSA 문서의 기본값(Pod `10.128.0.0/14`, Service `172.30.0.0/16`)을 쓰더라도 위 1번을 만족합니다(정적 시험에서 확인). 다만 기본값을 쓴다고 정해진 것은 아닙니다. 생성 뒤 `rosa describe cluster`의 실제 값으로 이 표를 갱신합니다(#35·#4).
+3. Pod·Service 대역은 터널 selector에 넣지 않습니다. selector를 넓혀 Pod 주소를 그대로 통과시키는 변경은 하지 않습니다.
 
 ## 2. Route 권위
 
 **Route 전파는 없습니다.** D21 transport는 AWS EC2 Relay(Libreswan) 1대이고, VGW·TGW·BGP는 채택하지 않았습니다([#34 권위표](https://github.com/321Team/fds-project-baseline/issues/34), infra-terraform `docs/preflight-20261007/freeze-execution-gates-20261010.md`). 그래서 이 구간의 모든 경로는 static이고, 경로마다 권위 원본이 하나씩 있습니다.
 
-| # | 경로 | 위치 | 권위 원본 | 변경 주체·승인 | 현재(2026-10-12) |
+| # | 경로 | 위치 | 권위 원본 | 변경 주체·승인 | 2026-10-12 작성 시점(과거 스냅샷, 현재 상태 근거 아님) |
 |---|---|---|---|---|---|
 | R1 | public `0.0.0.0/0 → IGW`, private `0.0.0.0/0 → NAT` | VPC route table 4개 | infra-terraform `terraform/network`(source `81162467`) | #35 IaC 실행 Lead 이하영, network Apply GO | 생산자 보고: Apply 완료·readback 20/20 PASS(2026-10-12 10:47 KST, [#11 6116326502](https://github.com/321Team/infra-terraform/issues/11#issuecomment-6116326502)). 독립 readback 검토와 Stage-A 완료는 별도 |
 | R2 | `private_a`: `10.1.93.0/24 → Relay ENI` | `private_a` route table | infra-terraform `terraform/vpn` `aws_route.onprem`(`activate_onprem_routes`, `onprem_route_keys=["private_a"]`만 허용) | #35 route 승인. 근거는 README 단계 B 증적 | OFF(`activate_onprem_routes=false`) |
@@ -129,7 +138,7 @@ SA가 없을 때는 Relay의 `rt ipsec missing` drop과 fail-closed 포워딩 �
 ## 5. 시험
 
 `python3 -m unittest discover -s p2-vpn-01/tests -v`에 포함됩니다(`tests/test_network_contract.py`). 확인하는 내용은 다음과 같습니다.
-- §1.1 확정 대역끼리 겹치지 않음, VPC 서브넷이 VPC 안에서 서로 겹치지 않음, ROSA 문서 기본값 후보도 확정 대역과 겹치지 않음
+- §1.1 확정 대역끼리 겹치지 않음, VPC 서브넷이 VPC 안에서 서로 겹치지 않음(ROSA Pod·Service 채택값 포함), host prefix `/23`이 문서에 있음
 - 양쪽 conn 템플릿의 selector가 §1.1의 On-Prem·VPC selector와 같음, 문서에 그 값이 있음
 - 템플릿 수명·`rekeymargin`에서 역할별 식으로 계산한 rekey 예정값이 §3.1 표와 같음, 응답자 half-margin(Relay Child 55분30초·IKE 7h55m30s) 회귀, 정상 역할의 시간 기반 예정값에서 vpn-gw01이 Relay보다 앞섬
 
