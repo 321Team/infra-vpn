@@ -6,6 +6,10 @@ delete table inet fds_p2_vpn
 table inet fds_p2_vpn {
 	chain forward {
 		type filter hook forward priority filter + 10; policy accept;
+		# 터널 안쪽 TCP는 ESP-in-UDP 오버헤드 때문에 1500 MTU를 다 쓸 수 없다. 연결 시작(SYN·SYN-ACK)의 MSS를 낮춰
+		# 큰 응답(TLS 인증서·DB 결과)이 터널 앞에서 버려지지 않게 한다. 허용 판정은 바꾸지 않는다.
+		ip saddr 10.20.0.0/16 tcp flags & (syn | rst) == syn tcp option maxseg size 1361-65535 counter tcp option maxseg size set 1360 comment "터널 MTU 맞춤: MSS 1360(ESP-in-UDP)"
+		ip daddr 10.20.0.0/16 tcp flags & (syn | rst) == syn tcp option maxseg size 1361-65535 counter tcp option maxseg size set 1360 comment "터널 MTU 맞춤: MSS 1360(ESP-in-UDP)"
 		ip saddr 10.20.0.0/16 jump from_vpc
 		ip daddr 10.20.0.0/16 jump to_vpc
 	}

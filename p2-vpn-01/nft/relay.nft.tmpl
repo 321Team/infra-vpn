@@ -6,6 +6,9 @@ delete table inet fds_p2_vpn
 table inet fds_p2_vpn {
 	chain forward {
 		type filter hook forward priority filter + 10; policy drop;
+		# 터널 안쪽 TCP의 MSS를 낮춘다(vpn-gw01과 같은 값). 허용 판정은 아래 체인이 한다.
+		ip saddr 10.20.0.0/16 ip daddr 10.1.93.0/24 tcp flags & (syn | rst) == syn tcp option maxseg size 1361-65535 counter tcp option maxseg size set 1360 comment "터널 MTU 맞춤: MSS 1360(ESP-in-UDP)"
+		ip saddr 10.1.93.0/24 ip daddr 10.20.0.0/16 tcp flags & (syn | rst) == syn tcp option maxseg size 1361-65535 counter tcp option maxseg size set 1360 comment "터널 MTU 맞춤: MSS 1360(ESP-in-UDP)"
 		ip saddr 10.20.0.0/16 ip daddr 10.1.93.0/24 jump to_onprem
 		ip saddr 10.1.93.0/24 ip daddr 10.20.0.0/16 jump from_onprem
 		counter comment "그 밖의 포워딩은 policy drop"
