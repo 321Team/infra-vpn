@@ -16,10 +16,10 @@ import unittest
 PKG = Path(__file__).resolve().parents[1]
 SCRIPT = PKG / "p2vpn.sh"
 IMAGES = {
-    # quay.io/centos/centos 고정 digest(2026-10-14 태그 manifest list). Relay AMI는 Stream 9, vpn-gw01은 Stream 10.
-    # 이전 고정값(2026-10-07 빌드 33346f5f…·e6644126…)은 quay.io에서 삭제돼(manifest unknown) 교체했다.
-    "stream9": "quay.io/centos/centos@sha256:4fdfb367402535024cd7703a67e4549ca3b0a0ee05081e06d89e24dce3a3827a",
-    "stream10": "quay.io/centos/centos@sha256:1e345af5447930fbb83dba37927a53a86b25b8b13433d94e59ecc55caab76da8",
+    # quay.io/centos/centos 고정 digest(2026-10-25 조회 태그 manifest list). Relay AMI는 Stream 9, vpn-gw01은 Stream 10.
+    # 이전 고정값(2026-10-07 빌드 33346f5f…·e6644126…, 2026-10-14 태그 4fdfb367…·1e345af5…)은 quay.io에서 삭제돼(manifest unknown) 교체했다.
+    "stream9": "quay.io/centos/centos@sha256:6f8045fc4f552544d8a401d61848bafc8d06ca7c11897c5b54a2c37fc419a20a",
+    "stream10": "quay.io/centos/centos@sha256:6f8d618844ed5af4365bad24bea19fb0435fd5ec808201af9aeb19d7a28eb515",
 }
 TEST_EIP = "203.0.113.10"  # RFC 5737 문서용 주소
 
@@ -76,6 +76,21 @@ class StaticContractTests(unittest.TestCase):
                 text = path.read_text(encoding="utf-8")
                 self.assertNotRegex(text, r'PSK\s+"[^"%]', f"{path}: PSK 값")
                 self.assertNotRegex(text, r"(?i)set -x|bash -x|xtrace on", f"{path}: xtrace")
+
+    def test_mss_clamp_both_directions_before_verdicts(self):
+        # 10/22 창 B: worker MSS 8961 -> harbor01 TLS 응답이 ESP-in-UDP 터널 앞에서 버려졌다(vpn-gw01 IpFragFails).
+        clamp = ("tcp flags & (syn | rst) == syn tcp option maxseg size 1361-65535 counter "
+                 "tcp option maxseg size set 1360")
+        for role in ("relay", "vpn-gw01"):
+            text = (PKG / f"nft/{role}.nft.tmpl").read_text(encoding="utf-8")
+            rules = [l.strip() for l in text.splitlines() if clamp in l]
+            self.assertEqual(len(rules), 2, f"{role}: 양방향 2줄")
+            self.assertTrue(any("ip saddr 10.20.0.0/16" in r for r in rules), role)
+            self.assertTrue(any("ip daddr 10.20.0.0/16" in r for r in rules), role)
+            for r in rules:  # MSS만 바꾸고 허용·차단 판정은 하지 않는다
+                self.assertNotRegex(r, r"(accept|drop|reject|jump|goto)", role)
+            first_jump = text.index("jump ")
+            self.assertTrue(all(text.index(r) < first_jump for r in rules), f"{role}: 판정 체인보다 먼저")
 
     def test_forward_tables_fail_closed(self):
         for role in ("relay", "vpn-gw01"):
